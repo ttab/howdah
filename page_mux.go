@@ -3,6 +3,7 @@ package howdah
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 )
 
@@ -35,12 +36,26 @@ func (pm *PageMux) Handle(pattern string, handler PageHandler) {
 
 			herr := AsHTTPError(err)
 
+			if pm.r == nil {
+				http.Error(w,
+					fmt.Sprintf("no page renderer: %v", err),
+					herr.Code)
+
+				return
+			}
+
 			pm.r.ErrorPage(r.Context(), w, r,
 				ErrorInfo{
 					Code:    herr.Code,
 					Error:   err,
 					Message: herr.Message,
 				})
+
+			return
+		}
+
+		if pm.r == nil {
+			http.Error(w, "no page renderer", http.StatusInternalServerError)
 
 			return
 		}
