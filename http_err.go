@@ -41,6 +41,17 @@ func AsHTTPError(err error) *HTTPError {
 	return InternalHTTPError(err).(*HTTPError) //nolint: errorlint
 }
 
+func LiteralHTTPError(code int, err error) error {
+	return &HTTPError{
+		msg:   err.Error(),
+		cause: err,
+		Code:  code,
+		Message: TextLabel{
+			Literal: err.Error(),
+		},
+	}
+}
+
 type HTTPError struct {
 	msg   string
 	cause error
