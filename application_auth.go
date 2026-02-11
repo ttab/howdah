@@ -24,9 +24,10 @@ type OIDCUserInfoSource interface {
 }
 
 type OIDCAuth struct {
-	provider *oidc.Provider
-	verifier *oidc.IDTokenVerifier
-	conf     oauth2.Config
+	provider       *oidc.Provider
+	verifier       *oidc.IDTokenVerifier
+	accessVerifier *oidc.IDTokenVerifier
+	conf           oauth2.Config
 }
 
 func NewOIDCAuth(
@@ -37,7 +38,10 @@ func NewOIDCAuth(
 	return &OIDCAuth{
 		provider: provider,
 		verifier: verifier,
-		conf:     conf,
+		accessVerifier: provider.Verifier(&oidc.Config{
+			SkipClientIDCheck: true,
+		}),
+		conf: conf,
 	}
 }
 
@@ -56,7 +60,18 @@ func (a *OIDCAuth) MenuHook(hooks *MenuHooks) {
 	})
 }
 
-var tokenCtxKey int
+var (
+	tokenCtxKey       int
+	accessTokenCtxKey int
+)
+
+// AccessToken returns the verified access token from the context. Use the
+// Claims method on the returned IDToken to extract the token's claims into a
+// struct of your choosing.
+func AccessToken(ctx context.Context) (*oidc.IDToken, bool) {
+	token, ok := ctx.Value(&accessTokenCtxKey).(*oidc.IDToken)
+	return token, ok
+}
 
 func (a *OIDCAuth) OIDCUserInfo(ctx context.Context) (*oidc.UserInfo, error) {
 	token, ok := ctx.Value(&tokenCtxKey).(*oauth2.Token)
@@ -94,6 +109,18 @@ func (a *OIDCAuth) RequireAuth(
 		return ctx, ErrSkipRender
 	}
 
+	// We're making a pretty big assumption here, and that is that the
+	// access token actually is a JWT, it holds true for our environment,
+	// but YMMV.
+	accessToken, err := a.accessVerifier.Verify(ctx, token.AccessToken)
+	if err != nil {
+		slog.ErrorContext(ctx, "verify access token", "err", err)
+
+		http.Redirect(w, r, loginURL(r), http.StatusFound)
+
+		return ctx, ErrSkipRender
+	}
+
 	authCtx, err := twirp.WithHTTPRequestHeaders(ctx, http.Header{
 		"Authorization": []string{fmt.Sprintf("Bearer %s", token.AccessToken)},
 	})
@@ -103,6 +130,7 @@ func (a *OIDCAuth) RequireAuth(
 	}
 
 	authCtx = context.WithValue(authCtx, &tokenCtxKey, token)
+	authCtx = context.WithValue(authCtx, &accessTokenCtxKey, accessToken)
 
 	return authCtx, nil
 }
