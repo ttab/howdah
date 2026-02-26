@@ -50,15 +50,19 @@ func NewPageRenderer(
 	defaultLoc := i18n.NewLocalizer(translations, "en")
 
 	funcs := template.FuncMap{
-		"t":  tFunc(defaultLoc),
-		"td": tdFunc(defaultLoc),
-		"tl": tlFunc(defaultLoc),
+		"t":          tFunc(defaultLoc),
+		"td":         tdFunc(defaultLoc),
+		"tl":         tlFunc(defaultLoc),
+		"pathescape": url.PathEscape,
 		"lang": func() string {
 			return "en"
 		},
 		"ctx": context.Background,
 		"page_url": func() *url.URL {
 			return nil
+		},
+		"renderBlock": func(string, any) (template.HTML, error) {
+			return "", nil
 		},
 	}
 
@@ -143,6 +147,17 @@ func (pr *PageRenderer) localeTemplate(
 	}
 	tfn["page_url"] = func() *url.URL {
 		return r.URL
+	}
+
+	tfn["renderBlock"] = func(name string, data any) (template.HTML, error) {
+		var buf bytes.Buffer
+
+		err := tpl.ExecuteTemplate(&buf, name, data)
+		if err != nil {
+			return "", err
+		}
+
+		return template.HTML(buf.String()), nil
 	}
 
 	tpl.Funcs(tfn)
