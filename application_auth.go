@@ -234,6 +234,16 @@ func (a *OIDCAuth) authCallback(
 	failMsg := TL("FailedToHandleLogin",
 		"Failed to handle login, please try again")
 
+	if oidcErr := r.URL.Query().Get("error"); oidcErr != "" {
+		desc := r.URL.Query().Get("error_description")
+		if desc == "" {
+			desc = oidcErr
+		}
+
+		return nil, LiteralHTTPError(http.StatusForbidden,
+			fmt.Errorf("login denied by provider: %s", desc))
+	}
+
 	state, err := r.Cookie("state")
 	if err != nil {
 		return nil, HTTPErrorf(http.StatusBadRequest, failMsg,
