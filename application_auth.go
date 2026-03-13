@@ -23,19 +23,40 @@ type OIDCUserInfoSource interface {
 	OIDCUserInfo(ctx context.Context) (*oidc.UserInfo, error)
 }
 
+// LoginCallback is called after a successful OIDC callback and token
+// verification, before the session cookie is set. The IDToken is the verified
+// ID token from the provider — use Claims() to extract custom claims. Return
+// an error to abort the login.
+type LoginCallback func(ctx context.Context, idToken *oidc.IDToken) error
+
+// OIDCAuthOption configures an OIDCAuth instance.
+type OIDCAuthOption func(*OIDCAuth)
+
+// WithOnLogin registers a callback that is invoked after a successful OIDC
+// login. This is the right place to provision users, resolve organisations,
+// or perform other one-time setup that should happen at login rather than on
+// every authenticated request.
+func WithOnLogin(fn LoginCallback) OIDCAuthOption {
+	return func(a *OIDCAuth) {
+		a.onLogin = fn
+	}
+}
+
 type OIDCAuth struct {
 	provider       *oidc.Provider
 	verifier       *oidc.IDTokenVerifier
 	accessVerifier *oidc.IDTokenVerifier
 	conf           oauth2.Config
+	onLogin        LoginCallback
 }
 
 func NewOIDCAuth(
 	provider *oidc.Provider,
 	verifier *oidc.IDTokenVerifier,
 	conf oauth2.Config,
+	opts ...OIDCAuthOption,
 ) *OIDCAuth {
-	return &OIDCAuth{
+	a := &OIDCAuth{
 		provider: provider,
 		verifier: verifier,
 		accessVerifier: provider.Verifier(&oidc.Config{
@@ -43,6 +64,12 @@ func NewOIDCAuth(
 		}),
 		conf: conf,
 	}
+
+	for _, opt := range opts {
+		opt(a)
+	}
+
+	return a
 }
 
 func (a *OIDCAuth) RegisterRoutes(mux *PageMux) {
@@ -283,6 +310,14 @@ func (a *OIDCAuth) authCallback(
 	if idToken.Nonce != nonce.Value {
 		return nil, HTTPErrorf(http.StatusBadRequest, failMsg,
 			"nonce did not match")
+	}
+
+	if a.onLogin != nil {
+		err = a.onLogin(ctx, idToken)
+		if err != nil {
+			return nil, HTTPErrorf(http.StatusInternalServerError, failMsg,
+				"login callback: %w", err)
+		}
 	}
 
 	err = setTokenCookie(w, r, oauth2Token)
