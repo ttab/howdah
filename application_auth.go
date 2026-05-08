@@ -79,6 +79,34 @@ func (a *OIDCAuth) RegisterRoutes(mux *PageMux) {
 	mux.HandleFunc("GET /auth/callback", a.authCallback)
 }
 
+// Keepalive is an http.HandlerFunc that reads the OIDC token cookie and
+// refreshes the access token when it's near expiry, writing the new token
+// back to the cookie. It responds 204 No Content on success and 401
+// Unauthorized when there is no cookie or the refresh fails.
+//
+// Useful for periodic keepalive XHRs from the frontend so a user's session
+// doesn't drop while they're browsing pages that don't otherwise call
+// RequireAuth. Register on whichever http.ServeMux the application uses
+// for its API endpoints, e.g.
+//
+//	mux.HandleFunc("GET /auth/keepalive", auth.Keepalive)
+func (a *OIDCAuth) Keepalive(w http.ResponseWriter, r *http.Request) {
+	token, err := readTokenCookie(w, r)
+	if err != nil {
+		http.Error(w, "no session", http.StatusUnauthorized)
+
+		return
+	}
+
+	if _, ok := a.checkTokenExpiry(w, r, token); !ok {
+		http.Error(w, "refresh failed", http.StatusUnauthorized)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (a *OIDCAuth) MenuHook(hooks *MenuHooks) {
 	hooks.RegisterHook(func() []MenuItem {
 		return []MenuItem{
