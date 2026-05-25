@@ -128,6 +128,17 @@ func AccessToken(ctx context.Context) (*oidc.IDToken, bool) {
 	return token, ok
 }
 
+// Token returns the user's OAuth2 token (access + refresh + expiry)
+// from the auth context. RequireAuth places the post-refresh token
+// here, so callers that need to forward the access token to another
+// service or to the page should use this rather than re-reading the
+// request cookie — the request cookie is what the browser sent,
+// which is the pre-refresh value if RequireAuth just refreshed.
+func Token(ctx context.Context) (*oauth2.Token, bool) {
+	token, ok := ctx.Value(&tokenCtxKey).(*oauth2.Token)
+	return token, ok
+}
+
 func (a *OIDCAuth) OIDCUserInfo(ctx context.Context) (*oidc.UserInfo, error) {
 	token, ok := ctx.Value(&tokenCtxKey).(*oauth2.Token)
 	if !ok {
