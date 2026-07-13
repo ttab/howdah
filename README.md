@@ -205,7 +205,7 @@ auth := howdah.NewOIDCAuth(provider, verifier, oauth2Config)
 | `GET /auth/login` | Renders the login page |
 | `POST /auth/login` | Redirects to the OIDC provider |
 | `GET /auth/callback` | Handles the OIDC callback |
-| `GET /auth/logout` | Clears the session and redirects to `/` |
+| `GET /auth/logout` | Clears the session and redirects to the application root |
 
 ### Protecting routes
 
@@ -232,6 +232,63 @@ refreshes expired tokens automatically. On success it adds an
 `Authorization: Bearer` header to the context (for forwarding to backend
 services via Twirp) and stores the verified access token, retrievable with
 `howdah.AccessToken(ctx)`.
+
+## Mounting under a path prefix
+
+An application can be mounted under a path prefix on a shared server mux
+with `http.StripPrefix`. Since the application only ever sees stripped
+paths, anything that emits URLs for the browser (redirects, cookie paths,
+menu items, template links) needs to know the prefix. `BasePath` carries
+it:
+
+```go
+base := howdah.NewBasePath("/admin")
+
+auth := howdah.NewOIDCAuth(provider, verifier, oauth2Config,
+    howdah.WithBasePath(base),
+    // Required when multiple applications share a host, otherwise
+    // their sessions overwrite each other.
+    howdah.WithSessionCookieName("admin_token"),
+)
+
+appMux := http.NewServeMux()
+serverMux.Handle("/admin/", http.StripPrefix("/admin", appMux))
+
+app, err := howdah.NewApplication(logger, appMux, templates, locales, assets,
+    []howdah.Component{
+        base, // exposes {{base_path}} to templates
+        auth,
+        // ...
+    },
+)
+```
+
+With `WithBasePath` set, the OIDC login/logout redirects, the callback
+cookies, and the logout menu item all resolve against the mount point.
+Remember that the OAuth2 config's redirect URL must point at the prefixed
+callback (`https://example.com/admin/auth/callback`), and that the
+provider must allow it.
+
+In templates, prefix any absolute link or asset URL with `{{base_path}}`:
+
+```html
+<link rel="stylesheet" href="{{base_path}}/assets/css/style.css" />
+<a href="{{base_path}}/things/">Things</a>
+```
+
+In component code, build links with `BasePath.Path`:
+
+```go
+hooks.RegisterHook(func() []howdah.MenuItem {
+    return []howdah.MenuItem{
+        {Title: howdah.TL("Things"), HREF: base.Path("/things/"), Weight: 10},
+    }
+})
+```
+
+Applications mounted at the server root use the zero value `BasePath("")`,
+which leaves all paths unchanged — registering it keeps templates portable
+between prefixed and root-mounted applications.
 
 ## Error handling
 

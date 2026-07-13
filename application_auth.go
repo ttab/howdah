@@ -42,12 +42,34 @@ func WithOnLogin(fn LoginCallback) OIDCAuthOption {
 	}
 }
 
+// WithBasePath configures the auth component for an application that is
+// mounted under a path prefix (see BasePath). The base path is applied to
+// the login/logout redirects, the logout menu item, and the auth cookie
+// paths, so the flow stays within the mounted application.
+func WithBasePath(bp BasePath) OIDCAuthOption {
+	return func(a *OIDCAuth) {
+		a.basePath = bp
+	}
+}
+
+// WithSessionCookieName overrides the name of the session token cookie
+// (default "token"). Applications served on the same host must use
+// distinct session cookie names, otherwise logging in to one application
+// invalidates the session of the other.
+func WithSessionCookieName(name string) OIDCAuthOption {
+	return func(a *OIDCAuth) {
+		a.cookieName = name
+	}
+}
+
 type OIDCAuth struct {
 	provider       *oidc.Provider
 	verifier       *oidc.IDTokenVerifier
 	accessVerifier *oidc.IDTokenVerifier
 	conf           oauth2.Config
 	onLogin        LoginCallback
+	basePath       BasePath
+	cookieName     string
 }
 
 func NewOIDCAuth(
@@ -62,7 +84,8 @@ func NewOIDCAuth(
 		accessVerifier: provider.Verifier(&oidc.Config{
 			SkipClientIDCheck: true,
 		}),
-		conf: conf,
+		conf:       conf,
+		cookieName: "token",
 	}
 
 	for _, opt := range opts {
@@ -91,7 +114,7 @@ func (a *OIDCAuth) RegisterRoutes(mux *PageMux) {
 //
 //	mux.HandleFunc("GET /auth/keepalive", auth.Keepalive)
 func (a *OIDCAuth) Keepalive(w http.ResponseWriter, r *http.Request) {
-	token, err := readTokenCookie(w, r)
+	token, err := a.readTokenCookie(w, r)
 	if err != nil {
 		http.Error(w, "no session", http.StatusUnauthorized)
 
@@ -110,7 +133,11 @@ func (a *OIDCAuth) Keepalive(w http.ResponseWriter, r *http.Request) {
 func (a *OIDCAuth) MenuHook(hooks *MenuHooks) {
 	hooks.RegisterHook(func() []MenuItem {
 		return []MenuItem{
-			{Title: TL("LogOut", "Log out"), HREF: "/auth/logout", Weight: 999},
+			{
+				Title:  TL("LogOut", "Log out"),
+				HREF:   a.basePath.Path("/auth/logout"),
+				Weight: 999,
+			},
 		}
 	})
 }
@@ -156,21 +183,21 @@ func (a *OIDCAuth) OIDCUserInfo(ctx context.Context) (*oidc.UserInfo, error) {
 func (a *OIDCAuth) RequireAuth(
 	ctx context.Context, w http.ResponseWriter, r *http.Request,
 ) (context.Context, error) {
-	token, err := readTokenCookie(w, r)
+	token, err := a.readTokenCookie(w, r)
 	if err != nil {
 		if !errors.Is(err, http.ErrNoCookie) {
 			slog.ErrorContext(r.Context(), "read token cookie",
 				"err", err)
 		}
 
-		http.Redirect(w, r, loginURL(r), http.StatusFound)
+		http.Redirect(w, r, a.loginURL(r), http.StatusFound)
 
 		return ctx, ErrSkipRender
 	}
 
 	token, ok := a.checkTokenExpiry(w, r, token)
 	if !ok {
-		http.Redirect(w, r, loginURL(r), http.StatusFound)
+		http.Redirect(w, r, a.loginURL(r), http.StatusFound)
 
 		return ctx, ErrSkipRender
 	}
@@ -182,7 +209,7 @@ func (a *OIDCAuth) RequireAuth(
 	if err != nil {
 		slog.ErrorContext(ctx, "verify access token", "err", err)
 
-		http.Redirect(w, r, loginURL(r), http.StatusFound)
+		http.Redirect(w, r, a.loginURL(r), http.StatusFound)
 
 		return ctx, ErrSkipRender
 	}
@@ -235,7 +262,7 @@ func (a *OIDCAuth) checkTokenExpiry(
 		return nil, false
 	}
 
-	err = setTokenCookie(w, r, newToken)
+	err = a.setTokenCookie(w, r, newToken)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "set token cookie",
 			"err", err)
@@ -268,12 +295,12 @@ func (a *OIDCAuth) authRedirect(
 		return nil, fmt.Errorf("generate random nonce: %w", err)
 	}
 
-	setCallbackCookie(w, r, "state", state)
-	setCallbackCookie(w, r, "nonce", nonce)
+	a.setCallbackCookie(w, r, "state", state)
+	a.setCallbackCookie(w, r, "nonce", nonce)
 
 	redirect := r.URL.Query().Get("redirect")
 	if redirect != "" {
-		setCallbackCookie(w, r, "auth_redir", redirect)
+		a.setCallbackCookie(w, r, "auth_redir", redirect)
 	}
 
 	http.Redirect(
@@ -287,9 +314,9 @@ func (a *OIDCAuth) authRedirect(
 func (a *OIDCAuth) authLogout(
 	_ context.Context, w http.ResponseWriter, r *http.Request,
 ) (*Page, error) {
-	clearTokenCookie(w, r)
+	a.clearTokenCookie(w, r)
 
-	http.Redirect(w, r, "/", http.StatusFound)
+	http.Redirect(w, r, a.basePath.Path("/"), http.StatusFound)
 
 	return nil, ErrSkipRender
 }
@@ -359,17 +386,17 @@ func (a *OIDCAuth) authCallback(
 		}
 	}
 
-	err = setTokenCookie(w, r, oauth2Token)
+	err = a.setTokenCookie(w, r, oauth2Token)
 	if err != nil {
 		return nil, HTTPErrorf(http.StatusInternalServerError, failMsg,
 			"set token cookie: %w", err)
 	}
 
-	redir := "/"
+	redir := a.basePath.Path("/")
 
 	redirCookie, err := r.Cookie("auth_redir")
-	if err == nil {
-		redir = redirCookie.Value
+	if err == nil && safeRedirectPath(redirCookie.Value) {
+		redir = a.basePath.Path(redirCookie.Value)
 	}
 
 	http.Redirect(w, r, redir, http.StatusFound)
@@ -377,12 +404,27 @@ func (a *OIDCAuth) authCallback(
 	return nil, ErrSkipRender
 }
 
-func loginURL(r *http.Request) string {
+// loginURL builds the login redirect target for unauthenticated requests.
+// The redirect parameter is the application-relative URL of the current
+// request; the base path is applied when the callback redirects back to
+// it.
+func (a *OIDCAuth) loginURL(r *http.Request) string {
 	v := url.Values{
 		"redirect": {r.URL.String()},
 	}
 
-	return "/auth/login?" + v.Encode()
+	return a.basePath.Path("/auth/login") + "?" + v.Encode()
+}
+
+// safeRedirectPath checks that a client-supplied redirect target is an
+// absolute path within the application, rejecting values that a browser
+// would treat as a scheme-relative or absolute URL to another host.
+func safeRedirectPath(path string) bool {
+	if !strings.HasPrefix(path, "/") {
+		return false
+	}
+
+	return !strings.HasPrefix(path, "//") && !strings.HasPrefix(path, "/\\")
 }
 
 func randString(nByte int) (string, error) {
@@ -394,7 +436,7 @@ func randString(nByte int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-func setTokenCookie(
+func (a *OIDCAuth) setTokenCookie(
 	w http.ResponseWriter, r *http.Request, token *oauth2.Token,
 ) error {
 	data, err := json.Marshal(token)
@@ -405,12 +447,12 @@ func setTokenCookie(
 	val := base64.RawURLEncoding.EncodeToString(data)
 
 	c := &http.Cookie{
-		Name:     "token",
+		Name:     a.cookieName,
 		Value:    val,
 		Expires:  time.Now().AddDate(0, 0, 7),
 		Secure:   r.TLS != nil,
 		HttpOnly: true,
-		Path:     "/",
+		Path:     a.basePath.Path("/"),
 	}
 
 	http.SetCookie(w, c)
@@ -418,15 +460,17 @@ func setTokenCookie(
 	return nil
 }
 
-func readTokenCookie(w http.ResponseWriter, r *http.Request) (*oauth2.Token, error) {
-	token, err := r.Cookie("token")
+func (a *OIDCAuth) readTokenCookie(
+	w http.ResponseWriter, r *http.Request,
+) (*oauth2.Token, error) {
+	token, err := r.Cookie(a.cookieName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cookie: %w", err)
 	}
 
 	data, err := base64.RawURLEncoding.DecodeString(token.Value)
 	if err != nil {
-		clearTokenCookie(w, r)
+		a.clearTokenCookie(w, r)
 
 		return nil, errors.New("invalid token cookie")
 	}
@@ -435,7 +479,7 @@ func readTokenCookie(w http.ResponseWriter, r *http.Request) (*oauth2.Token, err
 
 	err = json.Unmarshal(data, &tok)
 	if err != nil {
-		clearTokenCookie(w, r)
+		a.clearTokenCookie(w, r)
 
 		return nil, errors.New("invalid token cookie")
 	}
@@ -443,27 +487,29 @@ func readTokenCookie(w http.ResponseWriter, r *http.Request) (*oauth2.Token, err
 	return &tok, nil
 }
 
-func clearTokenCookie(w http.ResponseWriter, r *http.Request) {
+func (a *OIDCAuth) clearTokenCookie(w http.ResponseWriter, r *http.Request) {
 	c := &http.Cookie{
-		Name:     "token",
+		Name:     a.cookieName,
 		Value:    "",
 		Expires:  time.Now().Add(-24 * time.Hour),
 		Secure:   r.TLS != nil,
 		HttpOnly: true,
-		Path:     "/",
+		Path:     a.basePath.Path("/"),
 	}
 
 	http.SetCookie(w, c)
 }
 
-func setCallbackCookie(w http.ResponseWriter, r *http.Request, name, value string) {
+func (a *OIDCAuth) setCallbackCookie(
+	w http.ResponseWriter, r *http.Request, name, value string,
+) {
 	c := &http.Cookie{
 		Name:     name,
 		Value:    value,
 		MaxAge:   int(time.Hour.Seconds()),
 		Secure:   r.TLS != nil,
 		HttpOnly: true,
-		Path:     "/auth",
+		Path:     a.basePath.Path("/auth"),
 	}
 
 	http.SetCookie(w, c)
