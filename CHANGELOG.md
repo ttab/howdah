@@ -4,7 +4,7 @@ Everything from v0.1.0 forward is documented here; the releases before it are
 in the git history only. Entries are derived from the release tags, and the
 linked PRs hold the detail.
 
-## [v0.2.0] - Unreleased
+## [v0.2.0] - 2026-08-31
 
 **Breaking (NewOIDCAuth):** the constructor now takes a `*CookieKeyring` as
 its fourth argument and returns `(*OIDCAuth, error)`. Build the keyring with
