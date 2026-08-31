@@ -4,6 +4,47 @@ Everything from v0.1.0 forward is documented here; the releases before it are
 in the git history only. Entries are derived from the release tags, and the
 linked PRs hold the detail.
 
+## [v0.3.0] - Unreleased
+
+**No action needed for an existing consumer.** Sessions now go through a
+`howdah.TokenStore`, and the store an application gets without asking is
+`howdah.CookieTokenStore` — v0.2.0's session exactly, sealed into the cookie
+and byte-compatible with it, so nobody is logged out by the upgrade and no
+call has to change.
+
+**New (keeping sessions somewhere):** `howdah.WithTokenStore` hands `OIDCAuth`
+a store of your own. The store owns the session: it seals the handle that goes
+in the cookie, enforces the absolute session expiry, and decides how far the
+deduplication of a concurrent refresh reaches — per process for the
+cookie-backed store, and callers must not assume the token exchange runs
+exactly once. Implement `Create`, `Get`, `Update`, `Reseal`, `Delete`,
+`Refresh` and `DeleteExpired`, plus the optional `howdah.Rekeyer` if the store
+can re-seal what it holds under a new key without waiting for sessions to
+expire. `howdah.ErrNoSession` is what a store returns for a handle it cannot
+resolve. howdah starts no goroutines, so sweeping expired sessions is a
+`DeleteExpired` call on a schedule of the application's own.
+
+**Behaviour change (`WithMaxSessionAge`):** it configures the store howdah
+builds for itself, so passing it together with `WithTokenStore` is now a
+startup error rather than an option that quietly does nothing. A store brings
+its own session lifetime.
+
+Changes:
+
+- Logging out asks the store to forget the session before clearing the
+  cookie, which is what makes logout a revocation for a store that keeps
+  something. The cookie-backed store has nothing to forget, so an application
+  on the default sees no change.
+- A session's sealed payload now carries the OIDC `sub` claim, which costs a
+  few dozen bytes of the cookie's budget. The raw `id_token` is carried by
+  `howdah.NewSession` and `howdah.StoredToken`, for the `id_token_hint` that
+  RP-initiated logout will need, but the cookie-backed store drops it: another
+  JWT does not fit in the roughly 1.5 KB a store-less session has left.
+- Documentation: the README has a "Where sessions live" section, and
+  `docs/architecture.md` describes the read and refresh path through a store,
+  including why the session cookie is rewritten when the handle changed *or*
+  when the value came in under a retired key.
+
 ## [v0.2.0] - 2026-08-31
 
 **Breaking (NewOIDCAuth):** the constructor now takes a `*CookieKeyring` as

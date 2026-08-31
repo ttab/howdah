@@ -232,13 +232,43 @@ collapse onto a single round trip to the provider, per process. What ends a
 session, what `Keepalive` is for, and how refresh behaves are
 [docs/cookies.md §9](docs/cookies.md#9-what-ends-a-session).
 
+### Where sessions live
+
+A session is held by a `howdah.TokenStore`, and unless an application says
+otherwise that store is a `howdah.CookieTokenStore`: the whole session is
+sealed into the cookie and howdah keeps nothing. That is what howdah has
+always done, and it is the right answer for a small backoffice tool that
+should not need a database to have a login.
+
+It gives up two things that cannot be had without storing something. It
+cannot revoke — logging out clears one browser's cookie, and a copied cookie
+value keeps working until the session reaches its maximum age — and its
+deduplication of concurrent refreshes reaches one process rather than the
+fleet, so two replicas serving the same session inside the refresh margin can
+still both refresh. That is harmless until the provider rotates refresh
+tokens, at which point it is an intermittent mid-session logout.
+
+`WithTokenStore` hands `OIDCAuth` a store of the application's own instead.
+The store owns the session: it seals the handle that goes in the cookie,
+enforces the absolute expiry, and decides how far a concurrent refresh
+deduplicates. `OIDCAuth` cannot tell which one it is holding — it writes the
+handle a store hands back, and writes a new cookie only when that handle
+changed or when the value came in under a retired key.
+
+The interface is `Create`, `Get`, `Update`, `Reseal`, `Delete`, `Refresh` and
+`DeleteExpired`, plus an optional `Rekeyer` for a store that can re-seal what
+it holds under a new key without waiting for sessions to expire. howdah
+starts no goroutines of its own, so an application that wants expired
+sessions swept calls `DeleteExpired` on a schedule of its own.
+
 ### Options
 
 | Option | Effect |
 |---|---|
 | `WithBasePath` | Resolve redirects and cookie paths against a mount prefix. See [Mounting under a path prefix](#mounting-under-a-path-prefix). |
 | `WithSessionCookieName` | Name the session cookie. Required when applications share a host, and it is also the sealing domain. |
-| `WithMaxSessionAge` | Change the maximum session age from `DefaultMaxSessionAge`. |
+| `WithMaxSessionAge` | Change the maximum session age from `DefaultMaxSessionAge`. Configures the store howdah builds for itself, so it cannot be combined with `WithTokenStore`. |
+| `WithTokenStore` | Keep sessions in a store of your own rather than in the cookie. See [Where sessions live](#where-sessions-live). |
 | `WithInsecureCookies` | Drop `Secure`. For a plain-http local run, and nothing else. |
 | `WithOnLogin` | A callback after a successful login, before the session cookie is set. Provision users here rather than on every request. |
 

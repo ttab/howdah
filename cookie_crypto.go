@@ -114,14 +114,18 @@ var errNoCookieKeyring = errors.New("the cookie keyring is not initialised")
 // the cookie name is checked for the colon that would let two labels
 // collide.
 //
-// This pair is deliberately unexported for now, even though the keyring
-// itself is a type applications construct. An exported Seal whose domain
-// argument can only be built correctly by unexported code is an invitation
-// to hand-write the string, and a hand-written "cookie:token" is the
-// privilege escalation the domain exists to close. The release that adds
-// token stores needs both halves outside the package — a store seals its own
-// payloads — and that is when they are exported together, along with the
-// store purpose and the kind the stores use.
+// This pair is deliberately unexported, even though the keyring itself is a
+// type applications construct. An exported Seal whose domain argument can
+// only be built correctly by unexported code is an invitation to hand-write
+// the string, and a hand-written "cookie:token" is the privilege escalation
+// the domain exists to close.
+//
+// Sealing is a store's job — see TokenStore, which settles that — and
+// CookieTokenStore is in this package, so it uses these directly. A store in
+// a subpackage cannot, so the release that adds the Postgres-backed one is
+// what exports them: both halves together, with the store purpose, the
+// handle kind, and a domain builder, so that the only way to name a domain
+// from outside is still to ask for one.
 func (k *CookieKeyring) seal(domain string, plaintext []byte) (string, error) {
 	return k.sealKind(sessionKindPayload, domain, plaintext)
 }

@@ -254,10 +254,18 @@ A session ends, and the user logs in again, when any of these is true:
 | The cookie cannot be opened | The taxonomy in §8 |
 | The sealed `issued_at` is older than the maximum session age | `unusable session cookie` with the age and the cap |
 | The refresh token is rejected by the provider | `refresh the access token` at error level |
-| The user logs out | Nothing; the cookie is cleared |
+| The user logs out | Nothing; the store is asked to forget the session and the cookie is cleared |
 
-**The maximum session age is counted against an `issued_at` sealed into the
-cookie, not against the cookie's `Expires`,** which is only ever a request to
+A session is held by a `howdah.TokenStore`, and the default one seals it into
+the cookie and keeps nothing — which is why logging out clears one browser and
+revokes nothing, and why a copied cookie value keeps working until the session
+reaches its maximum age. A store that keeps sessions somewhere makes logout a
+revocation, and everything below is then the store's answer rather than the
+cookie's. See [Where sessions live](../README.md#where-sessions-live).
+
+**The maximum session age is counted against an `issued_at` the store keeps —
+for the default store, sealed into the cookie — not against the cookie's
+`Expires`,** which is only ever a request to
 the browser and means nothing to somebody holding a copied value. Refreshing
 the access token does not extend it, and the `issued_at` is carried forward
 unchanged across every re-seal — restarting it would slide the cap forward
@@ -292,11 +300,13 @@ With refresh token rotation enabled at the provider they otherwise would: the
 first exchange invalidates the token and the rest come back `invalid_grant`,
 bouncing the user to login intermittently and under load.
 
-**The deduplication is per process and does not reach across replicas.** The
-tokens live in the cookie, so there is nothing for two replicas to coordinate
-through. Two replicas serving the same session inside the refresh margin can
-still both refresh, which is the remaining exposure if rotation is turned on
-fleet-wide.
+**With the default store the deduplication is per process and does not reach
+across replicas.** The tokens live in the cookie, so there is nothing for two
+replicas to coordinate through. Two replicas serving the same session inside
+the refresh margin can still both refresh, which is the remaining exposure if
+rotation is turned on fleet-wide. How far the deduplication reaches is the
+store's to decide and to document, and callers cannot assume the exchange runs
+exactly once.
 
 Two fields RFC 6749 leaves optional are decided where a token enters the
 session rather than in the request path. A refresh response without a
@@ -355,9 +365,9 @@ of it should not be shown to them.
 3. **Wait out the maximum session age** (`howdah.DefaultMaxSessionAge`,
    or whatever `WithMaxSessionAge` was given). Re-sealing only happens on a
    request, so an idle session keeps its key 1 cookie until its user comes
-   back or it ages out; there is no way to sweep outstanding cookies. A
-   later release that keeps sessions server-side will replace this wait with
-   a re-key pass.
+   back or it ages out; there is no way to sweep outstanding cookies. A store
+   that implements `howdah.Rekeyer` replaces this wait with a sweep; the
+   cookie-backed one cannot, since outstanding cookies cannot be reached.
 4. **Drop the old key.** Remove `COOKIE_KEY_1` and deploy. Renumber the rest
    if you like — the numbers carry no meaning. Any straggler still holding a
    value sealed under key 1 comes back as `ErrUnknownKey`, has its cookie

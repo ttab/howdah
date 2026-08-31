@@ -431,7 +431,7 @@ func TestOversizedSessionCookieFailsTheLogin(t *testing.T) {
 
 	w := httptest.NewRecorder()
 
-	err := auth.setTokenCookie(w, token, time.Now())
+	err := auth.setTokenCookie(w, storeTestSession(t, auth, token, time.Now()))
 	if err == nil {
 		t.Fatal("setTokenCookie accepted a session too large for a cookie")
 	}
@@ -448,7 +448,8 @@ func TestOversizedSessionCookieFailsTheLogin(t *testing.T) {
 	// refusing everything.
 	w = httptest.NewRecorder()
 
-	err = auth.setTokenCookie(w, testToken(time.Now().Add(time.Hour)), time.Now())
+	err = auth.setTokenCookie(w, storeTestSession(t, auth,
+		testToken(time.Now().Add(time.Hour)), time.Now()))
 	if err != nil {
 		t.Fatalf("setTokenCookie refused a normal session: %v", err)
 	}

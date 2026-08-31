@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,7 +16,6 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/twitchtv/twirp"
 	"golang.org/x/oauth2"
-	"golang.org/x/sync/singleflight"
 )
 
 type OIDCUserInfoSource interface {
@@ -107,17 +105,37 @@ func WithSessionCookieName(name string) OIDCAuthOption {
 
 // WithMaxSessionAge sets how long a session may live before the user has to
 // log in again (default DefaultMaxSessionAge). The age is measured against
-// an issued_at sealed into the session cookie, so it is a limit the server
-// enforces rather than an instruction the browser is asked to follow — and
-// it survives a refresh, because the refresh re-seals the same issued_at.
+// an issued_at the store keeps, so it is a limit the server enforces rather
+// than an instruction the browser is asked to follow — and it survives a
+// refresh, because the issued_at is carried forward unchanged.
 //
 // Raising it is not free. A store-less session cannot be revoked, so the
 // maximum session age is also how long a copied cookie value keeps working,
 // and how long a retired cookie key has to stay in the keyring before it
 // can be dropped.
+//
+// It configures the store howdah builds for itself, so it cannot be
+// combined with WithTokenStore: a store brings its own session lifetime, and
+// an option that quietly did nothing would be the wrong kind of surprise for
+// a session limit.
 func WithMaxSessionAge(d time.Duration) OIDCAuthOption {
 	return func(a *OIDCAuth) {
 		a.maxSessionAge = d
+		a.maxSessionAgeSet = true
+	}
+}
+
+// WithTokenStore hands the auth component a store to keep sessions in,
+// instead of the cookie-backed one it builds for itself. The store owns the
+// session: it seals the handle that goes in the cookie, enforces the
+// absolute expiry, and decides how far the deduplication of a concurrent
+// refresh reaches.
+//
+// The store still needs the keyring — every store seals — so the keyring
+// argument to NewOIDCAuth remains required whether or not this is passed.
+func WithTokenStore(store TokenStore) OIDCAuthOption {
+	return func(a *OIDCAuth) {
+		a.store = store
 	}
 }
 
@@ -146,8 +164,19 @@ type OIDCAuth struct {
 	onLogin        LoginCallback
 	basePath       BasePath
 	cookieName     string
-	maxSessionAge  time.Duration
 	insecure       bool
+
+	// store holds the sessions. It is a CookieTokenStore unless the
+	// application passed WithTokenStore, and OIDCAuth cannot tell the
+	// difference: it writes the Handle a write hands back and reads it
+	// again on the next request.
+	store TokenStore
+
+	// maxSessionAge configures the store howdah builds for itself, and is
+	// refused together with WithTokenStore — a store of the
+	// application's own brings its own lifetime.
+	maxSessionAge    time.Duration
+	maxSessionAgeSet bool
 
 	// sessionDomain and redirDomain are the domain strings the session
 	// and auth_redir cookie values are sealed under. They are built once,
@@ -155,10 +184,6 @@ type OIDCAuth struct {
 	// is a startup error rather than a failure on the first login.
 	sessionDomain string
 	redirDomain   string
-
-	// refresh collapses the concurrent refreshes of one session onto a
-	// single token endpoint round trip. See refreshToken.
-	refresh singleflight.Group
 }
 
 // NewOIDCAuth builds the auth component. The keyring seals the session
@@ -209,6 +234,21 @@ func NewOIDCAuth(
 		cookieDomainAuthRedirect, a.cookieName)
 	if err != nil {
 		return nil, fmt.Errorf("auth redirect cookie: %w", err)
+	}
+
+	if a.store != nil && a.maxSessionAgeSet {
+		return nil, errors.New(
+			"WithMaxSessionAge configures the store howdah builds for" +
+				" itself and cannot be combined with WithTokenStore:" +
+				" the session lifetime is the store's")
+	}
+
+	// Store-less by default, which is v0.2.0's session exactly: the whole
+	// payload sealed into the cookie. An upgrade that quietly moved the
+	// sessions somewhere else would be an upgrade that logs the fleet out.
+	if a.store == nil {
+		a.store = newCookieTokenStore(
+			a.keyring, a.sessionDomain, a.maxSessionAge)
 	}
 
 	return a, nil
@@ -360,84 +400,109 @@ func (a *OIDCAuth) RequireAuth(
 
 // checkTokenExpiry refreshes the access token if it is close to expiry, and
 // is the one place the session cookie is written on an authenticated
-// request. The two reasons to write it — the token changed, or the value
-// was sealed under a key we no longer seal with — are mutually exclusive
-// branches here, so a response carries exactly one Set-Cookie for the
-// session whichever path the request takes.
+// request. There are two reasons to write it — the handle changed, or the
+// value came in under a key we no longer seal with — and each branch below
+// resolves both into a single write, so a response carries at most one
+// Set-Cookie for the session whichever path the request takes.
+//
+// Both reasons are needed, and the second is the one that is easy to drop. A
+// store whose handles are stable across a refresh — a session kept in a
+// database is — hands back the handle that went in, so "the handle changed"
+// alone would never fire and a key rollover would never migrate a stored
+// session at all.
 func (a *OIDCAuth) checkTokenExpiry(
-	w http.ResponseWriter, r *http.Request, session *authSession,
+	w http.ResponseWriter, r *http.Request, session *StoredToken,
 ) (*oauth2.Token, bool) {
-	if time.Until(session.token.Expiry) > tokenRefreshMargin {
-		if session.stale {
+	if time.Until(session.Token.Expiry) > tokenRefreshMargin {
+		if session.Stale {
 			// The value opened under a key that is on its way out, so
 			// it is re-sealed under the current one. This is what
 			// drains the old key during a rollover; without it a
 			// retired key can only be dropped once every outstanding
 			// session has aged out.
-			err := a.setTokenCookie(
-				w, session.token, session.issuedAt)
-			if err != nil {
-				// The session is fine — a failed re-seal is not a
-				// reason to log anybody out. The value stays under
-				// the old key and the next request tries again.
-				slog.ErrorContext(r.Context(),
-					"re-seal session cookie", "err", err)
-			}
+			a.migrateSessionCookie(w, r, session)
 		}
 
-		return session.token, true
+		return session.Token, true
 	}
 
-	newToken, err := a.refreshToken(r.Context(), session)
+	refreshed, err := a.store.Refresh(
+		r.Context(), session, a.exchangeToken)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "refresh token", "err", err)
 
 		return nil, false
 	}
 
-	// The issued_at is carried forward unchanged. Restarting it on a
-	// refresh would slide the session age cap forward every few minutes,
-	// which is to say it would enforce nothing at all.
-	err = a.setTokenCookie(w, newToken, session.issuedAt)
-	if err != nil {
-		slog.ErrorContext(r.Context(), "set token cookie", "err", err)
-
-		return nil, false
+	// A refresh does not necessarily move the handle — for a stored
+	// session it deliberately does not — so a value that came in under a
+	// retiring key still has to be re-sealed, or writing the refresh back
+	// would put the stale value in the cookie again and the rollover
+	// would never drain. Both happen before the single write below.
+	if session.Stale {
+		refreshed = a.resealSession(r.Context(), refreshed)
 	}
 
-	return newToken, true
+	if refreshed.Handle != session.Handle {
+		err = a.setTokenCookie(w, refreshed)
+		if err != nil {
+			slog.ErrorContext(r.Context(), "set token cookie", "err", err)
+
+			return nil, false
+		}
+	}
+
+	return refreshed.Token, true
 }
 
-// refreshToken exchanges the session's refresh token for a new one,
-// collapsing the concurrent refreshes of a single session onto one round
-// trip to the provider. A page load that fires several XHRs, plus the
-// keepalive, otherwise posts the same refresh token several times over:
-// wasteful today, and a mid-session logout for every loser the day the
-// realm turns on refresh token rotation. Collapsing them also settles which
-// token wins the cookie, since every caller gets the same one.
-//
-// The deduplication is per process and does not reach across replicas. That
-// is the bargain of keeping the tokens in the cookie rather than in a
-// store, and it covers the common case: the several requests of one page
-// load are handled by one process.
-func (a *OIDCAuth) refreshToken(
-	ctx context.Context, session *authSession,
-) (*oauth2.Token, error) {
-	// Keyed on the cookie value, so only requests carrying the same
-	// session share an exchange.
-	res, err, _ := a.refresh.Do(session.value, func() (any, error) {
-		return a.exchangeRefreshToken(ctx, session.token.RefreshToken)
-	})
+// resealSession returns the session with a handle sealed under the key the
+// keyring seals with now, or the session it was given if that fails. A
+// failed re-seal is not a reason to log anybody out: the value stays under
+// the old key and the next request tries again.
+func (a *OIDCAuth) resealSession(
+	ctx context.Context, session *StoredToken,
+) *StoredToken {
+	resealed, err := a.store.Reseal(ctx, session)
 	if err != nil {
-		return nil, fmt.Errorf("exchange refresh token: %w", err)
+		slog.ErrorContext(ctx, "re-seal session cookie", "err", err)
+
+		return session
 	}
 
-	token, ok := res.(*oauth2.Token)
-	if !ok {
-		return nil, fmt.Errorf("unexpected refresh result of type %T", res)
+	return resealed
+}
+
+// migrateSessionCookie moves a session that opened under a retiring key to
+// the current one. It is the request path's half of a key rollover, and it
+// writes nothing at all if the store cannot produce a new handle — a store
+// whose handles do not carry a key has nothing to migrate.
+func (a *OIDCAuth) migrateSessionCookie(
+	w http.ResponseWriter, r *http.Request, session *StoredToken,
+) {
+	resealed := a.resealSession(r.Context(), session)
+	if resealed.Handle == session.Handle {
+		return
 	}
 
-	return token, nil
+	err := a.setTokenCookie(w, resealed)
+	if err != nil {
+		slog.ErrorContext(r.Context(),
+			"re-seal session cookie", "err", err)
+	}
+}
+
+// exchangeToken is the token endpoint round trip a store's Refresh runs, and
+// the only part of a refresh that is OIDCAuth's business: which requests
+// share one exchange, and whether that reach is a process or the fleet, is
+// the store's.
+//
+// It may run in a goroutine other than the one that asked for it, and it may
+// not run at all for a caller that lost the race, so it holds no request
+// state.
+func (a *OIDCAuth) exchangeToken(
+	ctx context.Context, token *oauth2.Token,
+) (*oauth2.Token, error) {
+	return a.exchangeRefreshToken(ctx, token.RefreshToken)
 }
 
 func (a *OIDCAuth) exchangeRefreshToken(
@@ -608,13 +673,36 @@ func (a *OIDCAuth) authRedirect(
 }
 
 func (a *OIDCAuth) authLogout(
-	_ context.Context, w http.ResponseWriter, r *http.Request,
+	ctx context.Context, w http.ResponseWriter, r *http.Request,
 ) (*Page, error) {
+	a.deleteSession(ctx, r)
 	a.clearTokenCookie(w)
 
 	http.Redirect(w, r, a.basePath.Path("/"), http.StatusFound)
 
 	return nil, ErrSkipRender
+}
+
+// deleteSession asks the store to forget the session the request carries,
+// which is what makes logout a revocation rather than a gesture at one
+// browser. A store-less session has nothing to forget and says so by doing
+// nothing.
+//
+// A failure is logged and nothing more. The cookie is cleared either way:
+// there is nothing the user can do about a store that would not answer, and
+// leaving them logged in on the strength of it would be the wrong reading of
+// "log me out".
+func (a *OIDCAuth) deleteSession(ctx context.Context, r *http.Request) {
+	c, err := r.Cookie(a.cookieName)
+	if err != nil {
+		// No cookie, so no handle, so nothing to forget.
+		return
+	}
+
+	err = a.store.Delete(ctx, c.Value)
+	if err != nil {
+		slog.ErrorContext(ctx, "delete the session", "err", err)
+	}
 }
 
 func (a *OIDCAuth) authCallback(
@@ -702,10 +790,21 @@ func (a *OIDCAuth) authCallback(
 	// response carries no expires_in, exactly as the refresh does.
 	assumeTokenExpiry(ctx, oauth2Token)
 
-	// This is the one place a session's issued_at is set. Everything
-	// downstream carries it forward, so the age cap is measured from the
-	// login and from nothing else.
-	err = a.setTokenCookie(w, oauth2Token, time.Now())
+	// This is the one place a session is created, and so the one place its
+	// issued_at is set — by the store, which carries it forward across
+	// every refresh and re-seal, so the absolute expiry is measured from
+	// the login and from nothing else.
+	session, err := a.store.Create(ctx, NewSession{
+		Subject: idToken.Subject,
+		Token:   oauth2Token,
+		IDToken: rawIDToken,
+	})
+	if err != nil {
+		return a.failLogin(w, r,
+			fmt.Errorf("create the session: %w", err))
+	}
+
+	err = a.setTokenCookie(w, session)
 	if err != nil {
 		return a.failLogin(w, r,
 			fmt.Errorf("set the session cookie: %w", err))
@@ -754,37 +853,30 @@ func randString(nByte int) (string, error) {
 // bytes are sealed, this says what they mean once they are open.
 const sessionPayloadV1 = 1
 
-// sessionPayload is the plaintext a session cookie's envelope wraps. It is
-// a struct rather than the bare oauth2.Token JSON so that a session carries
-// the time it started, which is what lets the server cap the session's age
-// — a weaker expires_at that needs no database.
+// sessionPayload is the plaintext a store-less session's envelope wraps. It
+// is a struct rather than the bare oauth2.Token JSON so that a session
+// carries the time it started, which is what lets the server cap the
+// session's age — a weaker expires_at that needs no database.
 //
-// This is a wire contract, not an internal detail. The howdah release that
-// moves sealing behind a token store has to produce these bytes
-// byte-compatibly or every session in the fleet is logged out on upgrade,
-// so fields may be added but never renamed or repurposed, and anything else
-// takes a new Version.
+// This is a wire contract, not an internal detail: it is what a v0.2.0 build
+// wrote, and CookieTokenStore still writes and reads exactly it, so nobody is
+// logged out by the release that moved sealing behind a store. Fields may be
+// added — omitempty, so an existing cookie's bytes are unchanged — but never
+// renamed or repurposed, and anything else takes a new Version.
+//
+// The id_token StoredToken carries is deliberately not here; see
+// CookieTokenStore.Create for why a store-less session cannot afford it.
 type sessionPayload struct {
 	Version  int           `json:"v"`
 	IssuedAt time.Time     `json:"issued_at"`
 	Token    *oauth2.Token `json:"token"`
-}
 
-// authSession is a session as read from the cookie, and carries what the
-// write path needs to put it back.
-type authSession struct {
-	token    *oauth2.Token
-	issuedAt time.Time
-
-	// value is the cookie value the session was read from. It keys the
-	// refresh group, so the concurrent requests of one page load
-	// deduplicate against each other and nothing else.
-	value string
-
-	// stale reports that the value was sealed under a key that is no
-	// longer the one we seal with, so it wants re-sealing on the way out.
-	// See checkTokenExpiry, which is where that happens.
-	stale bool
+	// Subject is the OIDC sub claim, added after v0.2.0. A store-less
+	// session has no use for it of its own — nothing store-less can log a
+	// subject out everywhere — but it is part of what a TokenStore
+	// promises to hand back, and it costs a few dozen bytes rather than
+	// the kilobyte an id_token would.
+	Subject string `json:"sub,omitempty"`
 }
 
 // insecureCookies implements cookieSecurity so that the application can
@@ -798,107 +890,78 @@ func (a *OIDCAuth) insecureCookies() bool {
 // the size check below fails before the browser does rather than after.
 const cookieAttributeBudget = 120
 
+// setTokenCookie writes a session's handle to the session cookie. It is the
+// only place the handle reaches the browser, whichever store produced it.
 func (a *OIDCAuth) setTokenCookie(
-	w http.ResponseWriter, token *oauth2.Token, issuedAt time.Time,
+	w http.ResponseWriter, session *StoredToken,
 ) error {
-	data, err := json.Marshal(sessionPayload{
-		Version:  sessionPayloadV1,
-		IssuedAt: issuedAt,
-		Token:    token,
-	})
-	if err != nil {
-		return fmt.Errorf("marshal session payload: %w", err)
-	}
-
-	value, err := a.keyring.seal(a.sessionDomain, data)
-	if err != nil {
-		return fmt.Errorf("seal session payload: %w", err)
-	}
-
 	// Refuse rather than hand the browser a cookie it will drop on the
 	// floor. A dropped session cookie is a login that reports success and
 	// lands the user back on the login page, over and over, with nothing
 	// anywhere saying why — so failing the login outright is the kinder
 	// outcome, and the only one that names the cause.
 	//
-	// The store-less session carries the whole token set, so a provider
+	// A store-less session's handle is the whole token set, so a provider
 	// that issues large access tokens — a fat roles or groups claim is the
-	// usual reason — can push it past what a cookie can hold.
-	if size := len(value) + len(a.cookieName) + cookieAttributeBudget; size > cookieSizeLimit {
+	// usual reason — can push it past what a cookie can hold. A handle to a
+	// stored session is a hundred bytes and will not.
+	size := len(session.Handle) + len(a.cookieName) + cookieAttributeBudget
+	if size > cookieSizeLimit {
 		return fmt.Errorf(
-			"the sealed session is %d bytes, over the %d a cookie can hold:"+
-				" the provider's tokens are too large to keep in a cookie",
+			"the session cookie would be %d bytes, over the %d a cookie"+
+				" can hold: the provider's tokens are too large to keep"+
+				" in a cookie",
 			size, cookieSizeLimit)
 	}
 
 	setCookie(w, &http.Cookie{
 		Name:  a.cookieName,
-		Value: value,
+		Value: session.Handle,
 		// The browser is asked to drop the cookie at the moment the
 		// server would stop accepting it, so that the two agree on when
-		// the session ends. The server's copy of that deadline is the
-		// sealed issued_at, which is the one that counts.
-		Expires: issuedAt.Add(a.maxSessionAge),
+		// the session ends. The store's copy of that deadline is the one
+		// that counts.
+		Expires: session.ExpiresAt,
 		Path:    a.basePath.Path("/"),
 	}, a.insecure)
 
 	return nil
 }
 
-// readTokenCookie opens the session cookie. A cookie that cannot be used —
-// unsealed, sealed under a key that is gone, tampered with, or simply older
-// than the maximum session age — is cleared on the way out, so the browser
-// stops sending it.
+// readTokenCookie resolves the session cookie through the store. A cookie
+// that cannot be used — unsealed, sealed under a key that is gone, tampered
+// with, unknown to the store, or simply past the session's absolute expiry —
+// is cleared on the way out, so the browser stops sending it.
 //
-// The age cap is enforced here rather than in RequireAuth alone because
-// this is the single place a session enters the process: Keepalive would
-// otherwise keep refreshing a session past the cap that RequireAuth
-// refuses, leaving the user with a cookie that works everywhere except on
-// the pages they wanted.
+// The expiry is enforced wherever a session enters the process, not in
+// RequireAuth alone, because Keepalive would otherwise keep refreshing a
+// session past the limit RequireAuth refuses, leaving the user with a cookie
+// that works everywhere except on the pages they wanted. The store is what
+// makes that uniform: every reader goes through Get.
 func (a *OIDCAuth) readTokenCookie(
 	w http.ResponseWriter, r *http.Request,
-) (*authSession, error) {
+) (*StoredToken, error) {
 	c, err := r.Cookie(a.cookieName)
 	if err != nil {
 		return nil, fmt.Errorf("read session cookie: %w", err)
 	}
 
-	plaintext, current, err := a.keyring.open(a.sessionDomain, c.Value)
+	session, err := a.store.Get(r.Context(), c.Value)
 	if err != nil {
+		return nil, a.rejectTokenCookie(w, r, err)
+	}
+
+	// A store is a third party now, and everything downstream reads the
+	// token without checking. Refusing the session here turns a store that
+	// hands back nothing into a login redirect rather than a panic in
+	// whichever handler happened to call RequireAuth.
+	if session.Token == nil {
 		return nil, a.rejectTokenCookie(w, r,
-			fmt.Errorf("open session cookie: %w", err))
+			fmt.Errorf("%w: the store returned a session with no token",
+				ErrNoSession))
 	}
 
-	var payload sessionPayload
-
-	err = json.Unmarshal(plaintext, &payload)
-	if err != nil {
-		return nil, a.rejectTokenCookie(w, r,
-			fmt.Errorf("unmarshal session payload: %w", err))
-	}
-
-	if payload.Version != sessionPayloadV1 {
-		return nil, a.rejectTokenCookie(w, r, fmt.Errorf(
-			"unsupported session payload version %d", payload.Version))
-	}
-
-	if payload.Token == nil {
-		return nil, a.rejectTokenCookie(w, r,
-			errors.New("the session payload carries no token"))
-	}
-
-	if age := time.Since(payload.IssuedAt); age >= a.maxSessionAge {
-		return nil, a.rejectTokenCookie(w, r, fmt.Errorf(
-			"the session is %s old, past the maximum age of %s",
-			age.Round(time.Second), a.maxSessionAge))
-	}
-
-	return &authSession{
-		token:    payload.Token,
-		issuedAt: payload.IssuedAt,
-		value:    c.Value,
-		stale:    !current,
-	}, nil
+	return session, nil
 }
 
 // rejectTokenCookie clears an unusable session cookie, logs why at the level

@@ -180,18 +180,63 @@ is not optional in that arrangement, and it doubles as the sealing domain, so
 two applications can share a keyring without being able to open each other's
 sessions.
 
+## Where a session lives
+
+`OIDCAuth` does not hold sessions; a `TokenStore` does, and the default one is
+`CookieTokenStore`, which seals the whole session into the cookie and keeps
+nothing. The store owns sealing, which is the decision the interface is built
+around: if `OIDCAuth` sealed the handle itself it would have to choose the
+envelope's kind byte and know which kind to expect on the way back in, and
+that is the "which implementation have I got" switch the interface exists to
+remove.
+
+```
+  a request carrying a session cookie
+    │
+    ▼
+  readTokenCookie ── store.Get(cookie value) ──→ *StoredToken
+    │                    │ error wrapping ErrNoSession
+    │                    └─→ clear the cookie, 302 to login
+    ▼
+  checkTokenExpiry
+    ├─ access token has more than the refresh margin left
+    │    └─ Stale? ──→ store.Reseal ──→ one Set-Cookie
+    └─ otherwise
+         └─ store.Refresh(exchange) ──→ Stale? store.Reseal
+              └─ handle changed? ──→ one Set-Cookie
+```
+
+**The cookie is written when the handle changed *or* when the value came in
+under a key we no longer seal with,** and both halves are load-bearing. A
+store-less handle is the sealed session itself, so it changes on every write;
+a handle to a stored session survives a refresh, so "changed" alone would
+never fire and a key rollover would never reach a stored session at all.
+Every branch resolves to at most one `Set-Cookie`, which is what
+`TestSessionCookieReSealedUnderCurrentKey` and
+`TestStoredSessionStaleHandleIsResealed` hold the line on.
+
+The token endpoint round trip stays in `OIDCAuth` and is passed to
+`Refresh` as a function, on a context detached from the request: a client
+that disconnects mid-exchange would otherwise cancel a call the provider has
+already acted on, and with several requests collapsed onto one exchange the
+client that goes away is not necessarily the one that started it. Which
+requests share an exchange, and whether that reach is a process or the fleet,
+is the store's business.
+
 ## Pending work
 
-- **No server-side session store.** Sessions live entirely in the cookie, so
-  logout clears one browser and revokes nothing, a copied cookie value works
-  until the session age cap, and refresh deduplication cannot reach across
-  replicas. A `TokenStore` interface with a Postgres implementation is the
-  planned answer, and it also turns key retirement from "wait out the maximum
-  session age" into a re-key sweep.
+- **The only store is the cookie-backed one.** So logout clears one browser
+  and revokes nothing, a copied cookie value works until the session age cap,
+  and refresh deduplication cannot reach across replicas. A Postgres-backed
+  store is the planned answer — the interface is in place for it — and it also
+  turns key retirement from "wait out the maximum session age" into a re-key
+  sweep, which is what `Rekeyer` is declared for.
 - **Nothing talks to the provider on logout.** No RFC 7009 revocation and no
   RP-initiated logout, so a session howdah ends leaves a live refresh token at
-  the provider. The `id_token` needed for `id_token_hint` is not persisted
-  either: `json.Marshal` drops `oauth2.Token`'s `Extra` map.
+  the provider. `NewSession` and `StoredToken` carry the raw `id_token` that
+  `id_token_hint` needs — `json.Marshal` drops `oauth2.Token`'s `Extra` map,
+  so a store that does not take it at creation cannot get it back — but the
+  cookie-backed store drops it, having nowhere to put another JWT.
 - **`ErrWrongSessionKind` is reserved.** Nothing writes handle-kind envelopes
   yet; the byte and the error exist so the store can be added without a
   release in which the two shapes are indistinguishable.

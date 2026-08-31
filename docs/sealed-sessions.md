@@ -5,19 +5,35 @@ behind a `TokenStore` so refreshes have a single winner, and upstream the
 cookie hardening imagereporting is currently carrying downstream.
 
 > **This is a working document, not documentation.** It is kept because
-> sections 5, 6, 7 and parts of 10 and 11 still describe unbuilt v0.3.0 work.
-> Everything about v0.2.0 in here has shipped, and where it disagrees with the
-> documentation set the set wins — some figures in here were estimates that a
-> real measurement has since corrected. Delete this file when the token store
-> lands.
+> sections 6, 7 and parts of 10 and 11 still describe unbuilt v0.3.0 work.
+> Everything about v0.2.0 in here has shipped, and so has §5's interface, and
+> where it disagrees with the documentation set the set wins — some figures in
+> here were estimates that a real measurement has since corrected. Delete this
+> file when the Postgres-backed store lands and open decision 5 is answered.
 
 | | |
 |---|---|
-| Status | v0.2.0 shipped; v0.3.0 not started |
-| Shipped | §1–4, §8, §9, and the v0.2.0 half of §12 |
-| Still live | §5 the token store, §6 serialising refresh, §7 schema and migrations |
-| Documented properly in | [cookies.md](cookies.md), [architecture.md](architecture.md) |
+| Status | v0.2.0 shipped; v0.3.0 in progress — the interface and the cookie-backed store have landed |
+| Shipped | §1–4, §8, §9, the v0.2.0 half of §12, and §5's interface, `cookiestore` and `Rekeyer` |
+| Still live | §6 serialising refresh, §7 schema and migrations, §10's store tests, and open decision 5 |
+| Documented properly in | [cookies.md](cookies.md), [architecture.md](architecture.md), [README](../README.md#where-sessions-live) |
 | Superseded figures | §5's cookie sizes — measured at 2453 B, not the 3527 first estimated |
+
+### What §5 settled, and how
+
+The two questions §5 left open before the interface could be written are
+answered, and the answers are in the code rather than here:
+
+| Question | Answer |
+|---|---|
+| Who seals? | The stores do, and each takes the keyring. `TokenStore`'s doc comment carries the reasoning: sealing in `OIDCAuth` would make it choose the envelope's kind byte and know which kind to expect back, which is the type switch the interface exists to remove. |
+| Is "Set-Cookie when the handle changed" enough? | No, and the code says so. The condition is "changed **or** the value came in under a key we no longer seal with", because a stored session's handle survives a refresh and the first half alone would never migrate one. |
+
+Three things the implementation added that this document does not describe:
+`StoredToken.Stale`, which is how a store reports the second condition;
+`Reseal`, which is how a caller acts on it without writing tokens it only
+read; and the cookie-backed store's refusal to keep the raw `id_token`, since
+another JWT does not fit in the 1.5 KB a store-less session has left.
 
 ### What shipped, and where it is documented now
 
