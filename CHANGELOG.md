@@ -6,11 +6,13 @@ linked PRs hold the detail.
 
 ## [v0.3.0] - Unreleased
 
-**No action needed for an existing consumer.** Sessions now go through a
+**No code to change for an existing consumer.** Sessions now go through a
 `howdah.TokenStore`, and the store an application gets without asking is
 `howdah.CookieTokenStore` — v0.2.0's session exactly, sealed into the cookie
 and byte-compatible with it, so nobody is logged out by the upgrade and no
-call has to change.
+call has to change. Two things are still worth doing: add a
+`SessionUnavailable` message to the locale files, and read the behaviour
+change below if a frontend polls `Keepalive`.
 
 **New (keeping sessions somewhere):** `howdah.WithTokenStore` hands `OIDCAuth`
 a store of your own. The store owns the session: it seals the handle that goes
@@ -32,9 +34,14 @@ the server checks, and a refresh is serialised across the fleet — the several
 requests of a page load collapse onto one token endpoint round trip however
 many replicas they land on, which is what makes it safe to turn refresh token
 rotation on at the provider. `pgstore.New(pool, keyring, cookieName)`, then
-`howdah.WithTokenStore`. The store needs `github.com/jackc/pgx/v5`, which
-howdah now depends on directly: nothing links unless it is imported, but it is
-in the module graph of every consumer.
+`howdah.WithTokenStore`; the session lifetime, the refresh lease and the four
+timeouts around it are `pgstore.Option`s, and `pgstore.New` refuses a lease
+that does not outlast the token request timeout and the write timeout
+together. It reads and writes through a `pgstore.DB`, which a `*pgxpool.Pool`
+satisfies, and holds no connection across anything slower than one statement:
+the lease is what keeps a transaction from being open while the identity
+provider is being called, so a hung provider costs one slow request rather
+than the connection pool.
 
 **New (sealing from outside the package):** `howdah.SessionSealer` and
 `howdah.KeyID`, so a store in another package can seal the handle it puts in
@@ -42,25 +49,65 @@ the cookie and the payload it puts in its own storage. The domains a value is
 sealed under stay behind the constructor, because a hand-written one is the
 cross-cookie replay the domain exists to prevent.
 
+**Behaviour change (a session that cannot be resolved):** only a session that
+really is over clears the session cookie now. A session unknown to the store,
+past its absolute expiry, sealed under a key that is gone, or holding a
+refresh token the provider refused is unchanged: the cookie is cleared and the
+user logs in again. But a store that could not *answer* — the database was
+unreachable, the wait for another caller's refresh ran out — leaves the cookie
+alone and fails the request instead: `RequireAuth` returns a 503
+`howdah.HTTPError` (message id `SessionUnavailable`) rather than redirecting to
+login, and `Keepalive` answers 503 rather than 401. v0.2.0 cleared the cookie
+for both, which was harmless when the cookie *was* the session and is not once
+it is a handle to a row: a two-second failover would otherwise log out every
+user whose access token happened to be inside the refresh margin and leave
+their rows unreachable until the sweep. A frontend polling `Keepalive` should
+read 401 as "log in again" and 503 as "try again shortly", and an application
+with a locale file wants a `SessionUnavailable` message in it.
+`howdah.ErrRefreshRejected` is the sentinel that marks the failures which do
+end a session, and a store that answers a caller waiting on somebody else's
+refused refresh should wrap it — `pgstore.ErrRefreshFailed` does.
+
 **Behaviour change (`WithMaxSessionAge`):** it configures the store howdah
 builds for itself, so passing it together with `WithTokenStore` is now a
 startup error rather than an option that quietly does nothing. A store brings
 its own session lifetime.
 
-**Migrations (`pgstore`):** the table comes from tern migrations howdah
-carries, tracked in a version table of its own — `howdah_session_version` —
-so howdah's numbering cannot collide with the application's. **Apply them
-from a deliberate step, never from the service's startup path:**
-`pgstore.Migrate(ctx, pool)`, or `pgstore.Migrations` for tooling that would
-rather do it itself. Two jobs the application schedules, since howdah starts
-no goroutines: `DeleteExpired` sweeps expired sessions, and `Rekey` re-seals
-the table under the current key during a rollover, which turns step 3 of the
-rollover runbook from "wait out the maximum session age" into a sweep. Call
-either until it returns 0.
+**Migrations (`pgstore` only):** the table comes from tern migrations howdah
+carries, applied against a version table of howdah's own —
+`pgstore.SchemaVersionTable`, `howdah_session_version` — so howdah's numbering
+cannot collide with the numbering of the migrations the application already
+has in the same database. **Apply them from a deliberate step, never from the
+service's startup path:** `pgstore.Migrate(ctx, pool)`, `pgstore.MigrateConn`
+for an application holding a `*pgx.Conn`, or `pgstore.Migrations` for tooling
+that would rather apply them itself.
+
+- `001_session.sql` — creates the `howdah_session` table and its `expires_at`,
+  `subject` and `key_id` indexes. **Run it before the deploy that turns
+  `pgstore` on**, since the store's first read needs it. It touches nothing
+  that already exists, so it takes no lock worth planning around and needs no
+  maintenance window. Rolling it back drops the table, and every session in
+  it.
+
+**Also to schedule, because howdah starts no goroutines:** `DeleteExpired`
+sweeps sessions past their expiry, and `Rekey` re-seals the table under the
+current cookie key during a key rollover. Call either until it returns 0.
+`Rekey` is step 3 of the rollover runbook and it is not optional there: the
+request path re-seals the handle in the cookie, but only a refresh re-seals
+the row it points at, so dropping a retired key without the sweep ends the
+sessions of the users who were active. What it does not do is shorten the wait
+before a key can be dropped — nothing reaches a cookie in a browser that sends
+no requests.
 
 **Build:** the minimum Go version is now 1.26.5, raised by the
-`github.com/ttab/mage` targets howdah's magefiles import. A consumer on Go
-1.25 has to upgrade the toolchain before upgrading howdah.
+`github.com/ttab/mage` targets howdah's magefiles import, so a consumer on Go
+1.25 upgrades its toolchain before it upgrades howdah. Four new direct
+dependencies land in every consumer's module graph whether or not it imports
+`pgstore`: `github.com/jackc/pgx/v5` and `github.com/jackc/tern/v2` for the
+store and its migrations, `github.com/ttab/mage` for the magefiles, and
+`github.com/ttab/eltest` for the store's tests. Nothing links unless it is
+imported — `pgstore` is a package in the main module rather than a nested one,
+which keeps a release one tag at the price of that graph noise.
 
 Changes:
 
@@ -77,12 +124,15 @@ Changes:
   and `docs:links`, and an `sqlc.yaml` — every query pgstore runs is compiled
   by sqlc from `tokenstore/pgstore/postgres/queries.sql`. The store's tests
   run against a real Postgres in Docker through `github.com/ttab/eltest`.
-- Documentation: the README has "Where sessions live" and "Keeping sessions in
-  Postgres" sections, and `docs/architecture.md` describes the read and
-  refresh path through a store — including why the session cookie is rewritten
-  when the handle changed *or* when the value came in under a retired key, and
-  how the refresh lease serialises an exchange without holding a transaction
-  across the round trip to the provider.
+- Documentation: the README has "Where sessions live", with a table for
+  choosing between the two stores, and "Keeping sessions in Postgres".
+  `docs/architecture.md` describes the read and refresh path through a store —
+  why the session cookie is rewritten when the handle changed *or* when the
+  value came in under a retired key, and how the refresh lease serialises an
+  exchange without holding a transaction across the round trip to the
+  provider. `docs/cookies.md` says what is in a session cookie in each mode,
+  and its rollover runbook now covers both halves of a rollover: the cookie
+  the request path re-seals and the row only a sweep reaches.
 
 ## [v0.2.0] - 2026-08-31
 

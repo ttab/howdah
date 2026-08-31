@@ -14,15 +14,16 @@ cookie hardening imagereporting is currently carrying downstream.
 
 | | |
 |---|---|
-| Status | v0.2.0 and v0.3.0 shipped; §1–10 are built |
+| Status | v0.2.0 released; v0.3.0 built and awaiting a tag; §1–10 are built |
 | Shipped | all of §1–10, including §5's interface, the cookie-backed store, §6's refresh lease, §7's schema and migrations, and §10's store tests |
 | Still live | [§11's open decisions 4 and 5](#11-open-decisions). The build followed 4's recommendation — one module, pgx in every consumer's `go.sum` — and 5 is untouched: nothing talks to the provider on logout. |
 | Documented properly in | [cookies.md](cookies.md), [architecture.md](architecture.md), [README](../README.md#where-sessions-live) |
-| Superseded figures | §5's cookie sizes — measured at 2453 B, not the 3527 first estimated |
+| Superseded figures | §5's cookie sizes — measured at 2453 B, not the 3527 first estimated. §6's "15 s against 10 s" lease — the lease has to cover the write-back too, so the default is 20 s against 10 s plus 5 s |
+| Superseded claims | §5's and §9's "a `Rekey` sweep replaces the wait" — it does not. A stored session is sealed in two places, and the sweep reaches only the row: the handle in the browser's cookie is re-sealed by a request, so an idle session still holds the old key until its user comes back. The sweep is what keeps a retired key from killing the sessions of users who *are* active, which is why it is not optional, but the wait before a key can be dropped for free is the maximum session age in both modes. [cookies.md §11](cookies.md#11-rolling-a-key-over) is the runbook that got this right |
 
 ### What the implementation of §6 and §7 added
 
-The lease, the schema and the sweep are built as described, plus five things
+The lease, the schema and the sweep are built as described, plus ten things
 this document does not mention and each of which is load-bearing:
 
 | Addition | Why |
@@ -32,6 +33,11 @@ this document does not mention and each of which is load-bearing:
 | The whole of `Refresh` is bounded by one deadline | Every path back to the top of its loop is a wait for somebody else, including a lost write-back, so the budget belongs to the call rather than to each branch. |
 | `Rekey` deletes a payload that will not open | It is a session nobody can use, and skipping it would leave it in the set the sweep selects, so "call until it returns 0" would never terminate. |
 | `SessionSealer` in the root package | §5 settled that stores seal, but the unexported `seal`/`open` pair cannot be reached from a subpackage; the sealer exports both halves with the domains behind a constructor, so a hand-written domain is still impossible. |
+| The lease covers the write-back as well as the round trip | §6's "15 s against 10 s" only sizes the lease against the exchange, and the refresher holds it until `CommitRefresh` lands. A lease that expires while the winner is committing lets a second caller exchange the same refresh token, which is the failure the lease exists to prevent — so `New` requires the lease to outlast the token request timeout plus the write timeout, and the default is 20 s. |
+| The failure write-back's row count is read, not discarded | Zero rows means the nonce is gone, so this refresher no longer owns the refresh and its own `invalid_grant` is very likely the answer to a token the new owner has already rotated. Reporting it ends a session that was refreshed a millisecond earlier, so it is discarded exactly as a fenced-out success is. |
+| The re-read after a lost write-back is exempt from the wait | The write was fenced *because* somebody else's landed, so the result is committed and one read away. Honouring the budget there answers `ErrRefreshTimeout` — and, upstream, clears the cookie — over a token sitting in the row. |
+| Detaching the exchange must not throw the deadline away | `context.WithoutCancel` returns a context with no deadline at all, so `OIDCAuth`'s own detachment silently replaced the store's `tokenRequestTimeout` with a package constant — leaving the lease sized against a number nothing honoured. It now keeps whichever deadline comes first. |
+| Only a session that is over clears the cookie | §6 says `Keepalive` must clear the cookie when a refresh fails, and that is right for a refusal and wrong for everything else: a store that could not answer, or a wait that ran out, means "I could not find out", and in store mode the cookie is the only handle to a row that is still there. Those answer 503 and keep the cookie; `howdah.ErrRefreshRejected` marks the ones that do not. |
 
 ### What §5 settled, and how
 

@@ -19,7 +19,7 @@ go get github.com/ttab/howdah
 | Document | What it settles |
 |---|---|
 | **README** (this document) | Orientation and the working reference: what the package holds, how to wire an application up, and every option it takes. |
-| [docs/architecture.md](docs/architecture.md) | How howdah is built: the render pipeline, the hook system, and the OIDC flow. Read it before changing howdah itself. |
+| [docs/architecture.md](docs/architecture.md) | How howdah is built: the render pipeline, the hook system, the OIDC flow, and where a session lives. Read it before changing howdah itself. |
 | [docs/cookies.md](docs/cookies.md) | The cookie and session contract: sealing, the keyring, key rotation, and every way a session ends. |
 
 ## Quick start
@@ -205,10 +205,14 @@ howdah.TLiteral("Not translated")              // literal string, no lookup
 registers routes for login, callback, logout, and handles token refresh
 automatically.
 
-The keyring is not optional: the session cookie carries the user's access
-*and refresh* token, so howdah has no mode in which it writes them to the
-browser in the clear. That is why it is a positional argument rather than an
-option, and why the constructor returns an error.
+The keyring is not optional, whichever store the application runs. Without one
+the session cookie carries the user's access *and refresh* token, so howdah
+has no mode in which it writes those to the browser in the clear; with a store
+it carries a handle, and sealing that binds it to the cookie it lives in — so
+two applications sharing a host cannot open each other's sessions — and makes
+dropping a key a way to end the sessions sealed under it. Every store seals,
+so the keyring is a positional argument rather than an option, and the
+constructor returns an error.
 
 ```go
 keyring, err := howdah.CookieKeyringFromEnv(
@@ -228,8 +232,10 @@ format, how to generate a key, and how to roll one over.
 
 A session lives for `howdah.DefaultMaxSessionAge` (12 hours) and refreshing
 the access token does not extend it. Concurrent refreshes of one session
-collapse onto a single round trip to the provider, per process. What ends a
-session, what `Keepalive` is for, and how refresh behaves are
+collapse onto a single round trip to the provider — per process without a
+store, and fleet-wide with one that can coordinate. Both are the store's
+answer rather than howdah's: see [Where sessions live](#where-sessions-live).
+What ends a session, what `Keepalive` is for, and how refresh behaves are
 [docs/cookies.md §9](docs/cookies.md#9-what-ends-a-session).
 
 ### Where sessions live
@@ -240,13 +246,24 @@ sealed into the cookie and howdah keeps nothing. That is what howdah has
 always done, and it is the right answer for a small backoffice tool that
 should not need a database to have a login.
 
-It gives up two things that cannot be had without storing something. It
-cannot revoke — logging out clears one browser's cookie, and a copied cookie
-value keeps working until the session reaches its maximum age — and its
-deduplication of concurrent refreshes reaches one process rather than the
-fleet, so two replicas serving the same session inside the refresh margin can
-still both refresh. That is harmless until the provider rotates refresh
-tokens, at which point it is an intermittent mid-session logout.
+It gives up what cannot be had without storing something, and the two rows
+worth deciding on are revocation and how far a refresh deduplicates:
+
+| | `CookieTokenStore` (the default) | [`tokenstore/pgstore`](#keeping-sessions-in-postgres) |
+|---|---|---|
+| Needs a database | No | Yes |
+| In the cookie | The whole session, 2453 B measured | A handle, some 90 B |
+| Revoked by logging out | No — one browser's cookie is cleared, and a copied value works until the session ages out | Yes — the row is gone |
+| Log one person out everywhere | No | `DeleteSubject` |
+| Absolute expiry | A sealed `issued_at` the process checks | An `expires_at` column the database checks |
+| Refresh deduplication | Per process | Fleet-wide |
+| Safe with refresh token rotation at the provider | No | Yes |
+| Retiring a cookie key | Wait out the maximum session age | `Rekey` sweeps the rows; the cookies still wait |
+
+Per-process deduplication is harmless until the provider rotates refresh
+tokens, at which point two replicas serving one session inside the refresh
+margin is an intermittent mid-session logout — which makes turning rotation on
+fleet-wide a decision to move every application onto a store.
 
 `WithTokenStore` hands `OIDCAuth` a store of the application's own instead.
 The store owns the session: it seals the handle that goes in the cookie,
@@ -292,7 +309,7 @@ it safe to turn refresh token rotation on at the provider.
 | Option | Effect |
 |---|---|
 | `WithMaxSessionAge` | The absolute session lifetime. Defaults to `DefaultMaxSessionAge`. |
-| `WithRefreshLease` | How long a refresher holds the right to call the token endpoint. Must be longer than the token request timeout, and is what the next caller waits out if a refresher dies mid-exchange. |
+| `WithRefreshLease` | How long a refresher holds the right to refresh: the token endpoint round trip *and* the write-back. `New` refuses a lease that does not outlast the token request timeout and the write timeout together, and it is what the next caller waits out if a refresher dies mid-exchange. |
 | `WithTokenRequestTimeout` | Bounds the token endpoint round trip, which runs detached from the request. |
 | `WithRefreshMargin` | How little life an access token may have left for a concurrent refresh's result to be used as-is. |
 | `WithRefreshWait` | How long a caller waits for another caller's refresh before failing with `ErrRefreshTimeout`. |
@@ -309,10 +326,13 @@ that would rather do it itself.
 Two jobs the application schedules, because howdah starts no goroutines:
 `DeleteExpired(ctx, batch)` sweeps sessions past their expiry, and
 `Rekey(ctx, batch)` re-seals the table under the current key during a key
-rollover — which is step 3 of the [rollover
-runbook](docs/cookies.md#11-rolling-a-key-over), and the difference between
-retiring a key today and retiring it after the longest possible session. Call
-either until it returns 0.
+rollover. Call either until it returns 0. `Rekey` is step 3 of the [rollover
+runbook](docs/cookies.md#11-rolling-a-key-over) and it is not optional there:
+the request path re-seals the handle in the cookie, but only a refresh
+re-seals the row it points at, so dropping the old key without the sweep ends
+the sessions of the users who were active. What it does not do is make the
+wait shorter — a cookie in a browser that sends no requests is out of reach
+whichever store you run.
 
 ### Options
 
@@ -368,9 +388,12 @@ func (c *MyComponent) handlePage(
 
 `RequireAuth` redirects unauthenticated users to the login page and
 refreshes expired tokens automatically. A session cookie it cannot use —
-unsealed, sealed under a key that is gone, tampered with, or past the
-maximum session age — is cleared on the way out, so the browser stops
-sending it. On success it adds an
+unsealed, sealed under a key that is gone, tampered with, past the
+maximum session age, or holding a refresh token the provider has refused — is
+cleared on the way out, so the browser stops sending it. A session it merely
+could not *resolve* is a different matter: a store that would not answer
+leaves the cookie alone and returns a 503, because the session is very likely
+still there and the cookie may be the only handle to it. On success it adds an
 `Authorization: Bearer` header to the context (for forwarding to backend
 services via Twirp) and stores the verified access token, retrievable with
 `howdah.AccessToken(ctx)`.
