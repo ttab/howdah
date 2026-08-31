@@ -79,6 +79,15 @@ func NewApplication(
 		components: components,
 	}
 
+	// The set-language redirect has to resolve against the application's
+	// mount point, and page_url gives templates the request URL as the
+	// handler sees it, which http.StripPrefix has already trimmed.
+	for _, c := range components {
+		if bp, ok := c.(BasePath); ok {
+			a.basePath = bp
+		}
+	}
+
 	mux := NewPageMux(renderer, httpMux)
 
 	mux.HandleFunc("GET /set-language", a.setLanguage)
@@ -108,6 +117,7 @@ type Application struct {
 	render     *PageRenderer
 	mux        *http.ServeMux
 	components []Component
+	basePath   BasePath
 }
 
 func (a *Application) Cleanup() {}
@@ -121,10 +131,7 @@ func (a *Application) setLanguage(
 ) (*Page, error) {
 	query := r.URL.Query()
 
-	var (
-		lang     = query.Get("lang")
-		redirect = query.Get("redirect")
-	)
+	lang := query.Get("lang")
 
 	if lang == "" {
 		http.SetCookie(w, &http.Cookie{
@@ -140,8 +147,28 @@ func (a *Application) setLanguage(
 		})
 	}
 
-	w.Header().Add("Location", redirect)
-	w.WriteHeader(http.StatusTemporaryRedirect)
+	http.Redirect(w, r,
+		languageRedirect(a.basePath, query.Get("redirect")),
+		http.StatusTemporaryRedirect)
 
 	return nil, ErrSkipRender
+}
+
+// languageRedirect resolves the redirect parameter of the set-language
+// endpoint against the application's mount point.
+//
+// The parameter is client-supplied and goes straight into a Location header,
+// so anything a browser would resolve against another origin has to be
+// refused: without the check
+// "/set-language?lang=sv&redirect=https://evil.example" makes our own origin
+// hand visitors to someone else's. A rejected value falls back to the
+// application root rather than failing the request — the visitor asked to
+// change language, not to navigate, and there is nothing useful to tell them
+// about a link they did not write.
+func languageRedirect(bp BasePath, target string) string {
+	if !safeRedirectPath(target) {
+		return bp.Path("/")
+	}
+
+	return bp.Path(target)
 }
