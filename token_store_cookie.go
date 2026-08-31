@@ -227,6 +227,15 @@ func (s *CookieTokenStore) Refresh(
 			return nil, err //nolint: wrapcheck
 		}
 
+		// A token that is not there is a failure rather than something
+		// to seal. Sealing it writes a cookie whose payload carries
+		// "token": null, which every reader downstream would dereference
+		// — and this is the store an application holds itself, so the
+		// exchange is not necessarily the one OIDCAuth passes in.
+		if tok == nil {
+			return nil, errors.New("the exchange returned no token")
+		}
+
 		return s.seal(&StoredToken{
 			Subject:  t.Subject,
 			Token:    tok,
@@ -258,6 +267,14 @@ func (s *CookieTokenStore) DeleteExpired(
 // a mutated one, because a refresh hands the same value to every caller that
 // collapsed onto it.
 func (s *CookieTokenStore) seal(t *StoredToken) (*StoredToken, error) {
+	// The backstop for every path in, Reseal included: a session with no
+	// token seals into a cookie nothing can use, and one that opens
+	// without a token is worse than one that does not open at all, since
+	// only the second is refused as ErrNoSession.
+	if t == nil || t.Token == nil {
+		return nil, errors.New("a session needs a token")
+	}
+
 	data, err := json.Marshal(sessionPayload{
 		Version:  sessionPayloadV1,
 		IssuedAt: t.IssuedAt,

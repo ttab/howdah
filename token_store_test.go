@@ -343,3 +343,232 @@ func TestDefaultStoreIsCookieBacked(t *testing.T) {
 			store.domain, auth.sessionDomain)
 	}
 }
+
+// brokenStore fails the way a store backed by something outside the process
+// can fail, and lets each test say what kind of failure it is: one that means
+// the session is over, or one that means the store could not answer.
+type brokenStore struct {
+	stableHandleStore
+
+	getErr     error
+	refreshErr error
+	tokenless  bool
+}
+
+var _ TokenStore = (*brokenStore)(nil)
+
+func (s *brokenStore) Get(
+	ctx context.Context, handle string,
+) (*StoredToken, error) {
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+
+	return s.stableHandleStore.Get(ctx, handle)
+}
+
+func (s *brokenStore) Refresh(
+	ctx context.Context, t *StoredToken,
+	exchange func(context.Context, *oauth2.Token) (*oauth2.Token, error),
+) (*StoredToken, error) {
+	if s.refreshErr != nil {
+		return nil, s.refreshErr
+	}
+
+	if s.tokenless {
+		// A store that answers with a session carrying no token at all.
+		// pgstore refuses to write one; a store of the application's own
+		// may hand one back, and everything downstream of here reads the
+		// token without checking.
+		return &StoredToken{
+			Handle:    t.Handle,
+			IssuedAt:  t.IssuedAt,
+			ExpiresAt: t.ExpiresAt,
+		}, nil
+	}
+
+	return s.stableHandleStore.Refresh(ctx, t, exchange)
+}
+
+// TestSessionSurvivesAStoreThatCannotAnswer is the split that only became
+// real when the tokens moved into a store: which failures clear the session
+// cookie and which leave it alone.
+//
+// A store-less session is the cookie, so every failure to use it was a
+// failure of the session and clearing it cost nothing. A stored session is a
+// row and the cookie is the only handle to it, so a cookie cleared over a
+// two-second failover logs out every user whose access token happened to be
+// inside the refresh margin and orphans their rows until the sweep. Only a
+// session that really is over — unknown to the store, expired, or one the
+// provider has refused to refresh — may take the cookie with it.
+func TestSessionSurvivesAStoreThatCannotAnswer(t *testing.T) {
+	quietLogs(t)
+
+	tests := []struct {
+		name string
+		// store is built per caller, since each of them gets its own
+		// request and response.
+		store func() *brokenStore
+		// gone says the session is over, so the cookie is cleared and
+		// the user is sent to log in again.
+		gone bool
+	}{
+		{
+			name: "the store could not be read",
+			store: func() *brokenStore {
+				return &brokenStore{
+					getErr: errors.New(
+						"read the session row: dial tcp: connection refused"),
+				}
+			},
+		},
+		{
+			name: "the handle is unknown to the store",
+			store: func() *brokenStore {
+				return &brokenStore{
+					getErr: fmt.Errorf(
+						"%w: unknown session handle", ErrNoSession),
+				}
+			},
+			gone: true,
+		},
+		{
+			name: "the wait for another caller's refresh ran out",
+			store: func() *brokenStore {
+				return &brokenStore{
+					refreshErr: errors.New(
+						"timed out waiting for a concurrent refresh"),
+				}
+			},
+		},
+		{
+			name: "the provider refused the refresh",
+			store: func() *brokenStore {
+				return &brokenStore{
+					refreshErr: fmt.Errorf(
+						"%w: invalid_grant", ErrRefreshRejected),
+				}
+			},
+			gone: true,
+		},
+		{
+			// A store that answers without a token is a store with
+			// a bug rather than a session that ended, and it is
+			// treated as a session that ended anyway — the same way
+			// a read that comes back token-less is. The reason is
+			// what would otherwise happen: everything downstream
+			// reads the token without checking, so the alternative
+			// to a login redirect is a nil dereference in whichever
+			// handler called RequireAuth. Retrying it is no better,
+			// since the next request gets the same answer.
+			name: "the refresh produced a session with no token",
+			store: func() *brokenStore {
+				return &brokenStore{tokenless: true}
+			},
+			gone: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Run("RequireAuth", func(t *testing.T) {
+				store := test.store()
+				auth := newStoreAuth(t, withBrokenSession(store))
+
+				w := httptest.NewRecorder()
+				r := requestWithSession(auth, "row-handle")
+
+				_, err := auth.RequireAuth(r.Context(), w, r)
+
+				if test.gone {
+					if !errors.Is(err, ErrSkipRender) {
+						t.Errorf("got error %v, want ErrSkipRender", err)
+					}
+
+					if w.Code != http.StatusFound {
+						t.Errorf("got status %d, want %d",
+							w.Code, http.StatusFound)
+					}
+				} else {
+					httpErr := &HTTPError{}
+					if !errors.As(err, &httpErr) {
+						t.Fatalf("got error %v, want an HTTPError", err)
+					}
+
+					if httpErr.Code != http.StatusServiceUnavailable {
+						t.Errorf("got the status %d, want %d",
+							httpErr.Code,
+							http.StatusServiceUnavailable)
+					}
+				}
+
+				assertSessionCookie(t, w, auth, test.gone)
+			})
+
+			t.Run("Keepalive", func(t *testing.T) {
+				store := test.store()
+				auth := newStoreAuth(t, withBrokenSession(store))
+
+				w := httptest.NewRecorder()
+
+				auth.Keepalive(w, requestWithSession(auth, "row-handle"))
+
+				want := http.StatusServiceUnavailable
+				if test.gone {
+					want = http.StatusUnauthorized
+				}
+
+				if w.Code != want {
+					t.Errorf("got status %d, want %d", w.Code, want)
+				}
+
+				assertSessionCookie(t, w, auth, test.gone)
+			})
+		})
+	}
+}
+
+// withBrokenSession gives the store a session whose access token is already
+// past the refresh margin, so that a request reaches the refresh rather than
+// stopping at the read.
+func withBrokenSession(store *brokenStore) *brokenStore {
+	store.session = StoredToken{
+		Handle:    "row-handle",
+		Token:     testToken(time.Now().Add(-time.Minute)),
+		IssuedAt:  time.Now().Add(-time.Minute),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+
+	return store
+}
+
+// assertSessionCookie checks whether the response cleared the session cookie,
+// which is the whole point: a cleared cookie is the last handle to a stored
+// session, so clearing one over a failure the next request would recover from
+// is the bug.
+func assertSessionCookie(
+	t *testing.T, w *httptest.ResponseRecorder, auth *OIDCAuth, cleared bool,
+) {
+	t.Helper()
+
+	cookies := setCookies(w, auth.cookieName)
+
+	if !cleared {
+		if len(cookies) != 0 {
+			t.Errorf("the response wrote %d session cookies, want none: the session is still there and the cookie is the only handle to it",
+				len(cookies))
+		}
+
+		return
+	}
+
+	if len(cookies) != 1 {
+		t.Fatalf("got %d session cookies, want exactly 1 clearing the session",
+			len(cookies))
+	}
+
+	if cookies[0].Value != "" {
+		t.Errorf("the session cookie holds %q, want it cleared",
+			cookies[0].Value)
+	}
+}

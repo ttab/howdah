@@ -450,3 +450,42 @@ func TestCookieTokenStoreRefreshFailure(t *testing.T) {
 		t.Errorf("got error %v, want it to wrap the provider's", err)
 	}
 }
+
+// TestCookieTokenStoreRefusesASessionWithoutAToken covers the exchange that
+// comes back empty-handed. pgstore refuses to write one of those; this store
+// used to seal it, producing a cookie whose payload carried "token": null —
+// which opens, so nothing rejects it as a session that is gone, and every
+// reader downstream dereferences it. The store an application holds itself
+// takes an exchange of the application's own, so this is not a case only
+// howdah's own exchange could produce.
+func TestCookieTokenStoreRefusesASessionWithoutAToken(t *testing.T) {
+	store := newTestCookieStore(t)
+
+	session, err := store.seal(&StoredToken{
+		Token:    testToken(time.Now().Add(-time.Minute)),
+		IssuedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("seal the session: %v", err)
+	}
+
+	_, err = store.Refresh(t.Context(), session,
+		func(_ context.Context, _ *oauth2.Token) (*oauth2.Token, error) {
+			return nil, nil //nolint: nilnil
+		})
+	if err == nil {
+		t.Error("the store sealed a session the exchange did not produce a token for")
+	}
+
+	// The same guard from the other direction: a re-seal of a session that
+	// carries no token is refused rather than written.
+	_, err = store.Reseal(t.Context(), &StoredToken{IssuedAt: time.Now()})
+	if err == nil {
+		t.Error("the store re-sealed a session with no token")
+	}
+
+	_, err = store.Reseal(t.Context(), nil)
+	if err == nil {
+		t.Error("the store re-sealed a session that was not there")
+	}
+}

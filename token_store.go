@@ -19,6 +19,28 @@ import (
 // what decides how loudly the failure is logged. See rejectTokenCookie.
 var ErrNoSession = errors.New("no session")
 
+// ErrRefreshRejected says that a refresh failed in a way that ends the
+// session: the token endpoint refused the exchange, or refused the exchange
+// another caller was already running on this session's behalf. The refresh
+// token is gone, so there is nothing left to try and the user logs in again.
+//
+// It is the discriminator that keeps a store outage from looking like a dead
+// session. Every other failure a Refresh can report — the storage could not
+// be read, the wait for another caller's refresh ran out, the write-back was
+// refused — means "I could not find out", and the session it belongs to is
+// very likely still there. In store mode the cookie is the only handle to
+// it, so clearing the cookie over one of those turns a two-second database
+// failover into a logout for every user whose access token happened to be
+// inside the refresh margin, and orphans their rows until the sweep. Only a
+// failure wrapping this one, or one wrapping ErrNoSession, is a reason to
+// unset the session cookie; see sessionGone.
+//
+// A store does not have to produce it for the exchange failures it merely
+// passes on, because the exchange OIDCAuth hands to Refresh already wraps
+// its own. A store that answers a caller waiting on somebody else's failed
+// refresh has to wrap it itself — that caller never saw the exchange error.
+var ErrRefreshRejected = errors.New("the token refresh was rejected")
+
 // TokenStore holds a session's OAuth2 tokens. Implementations must be safe
 // for concurrent use by multiple goroutines and, where the storage is
 // shared, by multiple processes.
