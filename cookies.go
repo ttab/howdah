@@ -1,6 +1,9 @@
 package howdah
 
-import "net/http"
+import (
+	"log/slog"
+	"net/http"
+)
 
 // setCookie writes a cookie with the attributes every cookie howdah sets
 // carries. A caller decides a cookie's name, value, path and lifetime and
@@ -33,8 +36,26 @@ func setCookie(w http.ResponseWriter, c *http.Cookie, insecure bool) {
 	c.SameSite = http.SameSiteLaxMode
 	c.Secure = !insecure
 
+	// A browser drops an oversized cookie silently: no error to the server,
+	// nothing in the response, and for a session cookie the user simply
+	// arrives back at the login page having apparently logged in fine. That
+	// is close to undiagnosable from the outside, so it gets a log line of
+	// its own even though nothing here can prevent it.
+	if size := len(c.String()); size > cookieSizeLimit {
+		slog.Error("the cookie is too large for a browser to store",
+			"cookie", c.Name,
+			"bytes", size,
+			"limit", cookieSizeLimit)
+	}
+
 	http.SetCookie(w, c)
 }
+
+// cookieSizeLimit is the per-cookie budget, counting the name, the value and
+// the attributes. RFC 6265 requires a browser to support at least 4096 bytes
+// per cookie and browsers converged on exactly that, so a cookie above it is
+// one some browser will refuse.
+const cookieSizeLimit = 4096
 
 // cookieSecurity is implemented by components that carry a cookie security
 // posture, which in practice means OIDCAuth: WithInsecureCookies is the one

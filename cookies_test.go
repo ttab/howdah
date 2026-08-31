@@ -412,3 +412,48 @@ func responseCookie(
 
 	return nil
 }
+
+// TestOversizedSessionCookieFailsTheLogin covers the failure that is
+// otherwise invisible: a session cookie too large for a browser to store is
+// dropped silently, so the user logs in successfully and arrives back at the
+// login page with nothing logged anywhere. Failing the write is what turns
+// that into something diagnosable.
+func TestOversizedSessionCookieFailsTheLogin(t *testing.T) {
+	quietLogs(t)
+
+	auth := newTestAuth(t)
+
+	// A provider with a very fat roles claim. The token JSON goes into the
+	// sealed payload more or less verbatim, so this is what an oversized
+	// access token does.
+	token := testToken(time.Now().Add(time.Hour))
+	token.AccessToken = strings.Repeat("A", 5000)
+
+	w := httptest.NewRecorder()
+
+	err := auth.setTokenCookie(w, token, time.Now())
+	if err == nil {
+		t.Fatal("setTokenCookie accepted a session too large for a cookie")
+	}
+
+	if !strings.Contains(err.Error(), "over the") {
+		t.Errorf("error does not name the limit: %v", err)
+	}
+
+	if got := setCookies(w, auth.cookieName); len(got) != 0 {
+		t.Errorf("got %d session cookies, want none written", len(got))
+	}
+
+	// A normal token still goes through, so the guard is not simply
+	// refusing everything.
+	w = httptest.NewRecorder()
+
+	err = auth.setTokenCookie(w, testToken(time.Now().Add(time.Hour)), time.Now())
+	if err != nil {
+		t.Fatalf("setTokenCookie refused a normal session: %v", err)
+	}
+
+	if got := setCookies(w, auth.cookieName); len(got) != 1 {
+		t.Fatalf("got %d session cookies, want 1", len(got))
+	}
+}

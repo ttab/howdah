@@ -758,6 +758,11 @@ func (a *OIDCAuth) insecureCookies() bool {
 	return a.insecure
 }
 
+// cookieAttributeBudget is a generous allowance for the attributes
+// setCookie adds — Path, Expires, Max-Age, HttpOnly, Secure, SameSite — so
+// the size check below fails before the browser does rather than after.
+const cookieAttributeBudget = 120
+
 func (a *OIDCAuth) setTokenCookie(
 	w http.ResponseWriter, token *oauth2.Token, issuedAt time.Time,
 ) error {
@@ -773,6 +778,22 @@ func (a *OIDCAuth) setTokenCookie(
 	value, err := a.keyring.seal(a.sessionDomain, data)
 	if err != nil {
 		return fmt.Errorf("seal session payload: %w", err)
+	}
+
+	// Refuse rather than hand the browser a cookie it will drop on the
+	// floor. A dropped session cookie is a login that reports success and
+	// lands the user back on the login page, over and over, with nothing
+	// anywhere saying why — so failing the login outright is the kinder
+	// outcome, and the only one that names the cause.
+	//
+	// The store-less session carries the whole token set, so a provider
+	// that issues large access tokens — a fat roles or groups claim is the
+	// usual reason — can push it past what a cookie can hold.
+	if size := len(value) + len(a.cookieName) + cookieAttributeBudget; size > cookieSizeLimit {
+		return fmt.Errorf(
+			"the sealed session is %d bytes, over the %d a cookie can hold:"+
+				" the provider's tokens are too large to keep in a cookie",
+			size, cookieSizeLimit)
 	}
 
 	setCookie(w, &http.Cookie{
