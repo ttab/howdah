@@ -136,8 +136,10 @@ against the tt realm on stage is **2453 bytes**, leaving about 1550 to spare.
 The design document that preceded this work extrapolated 3527 from a guessed
 token size and concluded the cookie was nearly full; it was not. The ceiling
 is real all the same — a realm with a much fatter `roles` or `groups` claim
-would close that gap — and a later release that keeps sessions server-side
-would remove the question by putting a handle in the cookie instead.
+would close that gap — and the way out of the question entirely is to keep the
+session server-side: `tokenstore/pgstore` puts a sealed handle of about ninety
+bytes in the cookie and the tokens in a row, so the token set stops being part
+of the cookie's budget.
 
 ## 5. The keyring environment format
 
@@ -308,6 +310,12 @@ rotation is turned on fleet-wide. How far the deduplication reaches is the
 store's to decide and to document, and callers cannot assume the exchange runs
 exactly once.
 
+`tokenstore/pgstore` closes that gap: the row carries a refresh lease, so the
+exchange happens once per session however many replicas want one. Turning
+refresh token rotation on fleet-wide is therefore a decision to move every
+application onto a stored session — see
+[the store's own notes](../README.md#keeping-sessions-in-postgres).
+
 Two fields RFC 6749 leaves optional are decided where a token enters the
 session rather than in the request path. A refresh response without a
 `refresh_token` means "keep using the one you have", so the session's own is
@@ -366,8 +374,9 @@ of it should not be shown to them.
    or whatever `WithMaxSessionAge` was given). Re-sealing only happens on a
    request, so an idle session keeps its key 1 cookie until its user comes
    back or it ages out; there is no way to sweep outstanding cookies. A store
-   that implements `howdah.Rekeyer` replaces this wait with a sweep; the
-   cookie-backed one cannot, since outstanding cookies cannot be reached.
+   that implements `howdah.Rekeyer` — `tokenstore/pgstore` does — replaces
+   this wait with a `Rekey` sweep of its own storage, run until it returns 0;
+   the cookie-backed one cannot, since outstanding cookies cannot be reached.
 4. **Drop the old key.** Remove `COOKIE_KEY_1` and deploy. Renumber the rest
    if you like — the numbers carry no meaning. Any straggler still holding a
    value sealed under key 1 comes back as `ErrUnknownKey`, has its cookie

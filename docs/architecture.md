@@ -223,20 +223,68 @@ client that goes away is not necessarily the one that started it. Which
 requests share an exchange, and whether that reach is a process or the fleet,
 is the store's business.
 
+### One refresh per session, fleet-wide
+
+`tokenstore/pgstore` is the store for an application with a database, and
+what it adds beyond revocation and a server-checked expiry is that a refresh
+happens once per session however many replicas want one. It does that with a
+**lease column** rather than a lock:
+
+```
+  every caller ── read the row
+    ├─ the token in it is still good ──→ use it, no provider call
+    └─ otherwise ── conditional UPDATE taking the lease
+         ├─ got the row  ──→ exchange (detached ctx) ──→ commit, fenced on the
+         │                                              lease nonce
+         │                    └─ no rows? the lease was lost: discard, re-read
+         └─ got nothing ──→ poll on a bounded backoff until refreshed_at moves
+                            (or refresh_failed_at does, and fail fast)
+```
+
+**Not `SELECT … FOR UPDATE`, and not `pg_advisory_xact_lock`.** Either would
+serialise correctly and need no lease tuning, and either holds a transaction —
+and therefore a pooled connection — open across an HTTP round trip to the
+identity provider. A hung provider then pins one connection per concurrent
+request and drains the pool, so the failure mode is the whole application
+rather than just its logins. The lease holds no transaction: take it, commit,
+do the round trip, commit the result.
+
+Four details that are each a bug if left out, and each have a test:
+
+- **The write-back is fenced on a lease nonce.** A refresher whose exchange
+  finished but whose write stalled past its lease would otherwise land on top
+  of a fresher winner's tokens, leaving a rotated-away refresh token in the
+  row and the session dead everywhere.
+- **The exchange and the write-back run on a context detached from the
+  request.** The provider has already acted; a client that disconnects must
+  not take the rotated token with it.
+- **A refresher that fails records that.** Without the `refresh_failed_at`
+  column the waiting callers poll a `refreshed_at` that never moves, burn
+  their whole backoff, and then each attempt an exchange of their own — so a
+  provider outage becomes *n* serialised attempts per session instead of one.
+- **`Rekey`'s write is fenced on both `key_id` and `refreshed_at`.** A sweep
+  interleaving with a refresh would otherwise commit a re-sealed copy of the
+  *old* payload over the new one, which with rotation on resurrects a revoked
+  token.
+
+The row id is `sha256` of the handle rather than the handle, so a database
+dump yields no usable session, and the row id is in the sealed payload's AAD,
+so a writer with database access cannot transplant one session's payload into
+another's row.
+
 ## Pending work
 
-- **The only store is the cookie-backed one.** So logout clears one browser
-  and revokes nothing, a copied cookie value works until the session age cap,
-  and refresh deduplication cannot reach across replicas. A Postgres-backed
-  store is the planned answer — the interface is in place for it — and it also
-  turns key retirement from "wait out the maximum session age" into a re-key
-  sweep, which is what `Rekeyer` is declared for.
 - **Nothing talks to the provider on logout.** No RFC 7009 revocation and no
   RP-initiated logout, so a session howdah ends leaves a live refresh token at
   the provider. `NewSession` and `StoredToken` carry the raw `id_token` that
   `id_token_hint` needs — `json.Marshal` drops `oauth2.Token`'s `Extra` map,
   so a store that does not take it at creation cannot get it back — but the
-  cookie-backed store drops it, having nowhere to put another JWT.
-- **`ErrWrongSessionKind` is reserved.** Nothing writes handle-kind envelopes
-  yet; the byte and the error exist so the store can be added without a
-  release in which the two shapes are indistinguishable.
+  cookie-backed store drops it, having nowhere to put another JWT. `pgstore`
+  keeps it, so this is a piece of work rather than a piece of work plus a
+  migration.
+- **A session that survives a lost write-back.** If a refresh's exchange
+  succeeds and the commit then fails, the rotated token exists only in that
+  process's memory, and a stored session's cookie is only a handle — so there
+  is no recovery path and the user logs in again. Inherent to rotation plus
+  external storage, but it should be a monitored event rather than a
+  surprise.

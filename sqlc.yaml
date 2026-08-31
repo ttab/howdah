@@ -1,0 +1,9 @@
+version: "2"
+sql:
+- schema: "tokenstore/pgstore/postgres/schema.sql"
+  queries: "tokenstore/pgstore/postgres/queries.sql"
+  engine: "postgresql"
+  gen:
+    go:
+      out: "tokenstore/pgstore/postgres"
+      sql_package: "pgx/v5"

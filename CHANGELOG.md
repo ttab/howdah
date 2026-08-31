@@ -24,10 +24,43 @@ expire. `howdah.ErrNoSession` is what a store returns for a handle it cannot
 resolve. howdah starts no goroutines, so sweeping expired sessions is a
 `DeleteExpired` call on a schedule of the application's own.
 
+**New (sessions in Postgres):** `howdah/tokenstore/pgstore` keeps sessions in
+a `howdah_session` table, and the cookie holds a sealed handle of about ninety
+bytes instead of the token set. Logout becomes a revocation, `DeleteSubject`
+logs one person out of every browser at once, the absolute expiry is a column
+the server checks, and a refresh is serialised across the fleet — the several
+requests of a page load collapse onto one token endpoint round trip however
+many replicas they land on, which is what makes it safe to turn refresh token
+rotation on at the provider. `pgstore.New(pool, keyring, cookieName)`, then
+`howdah.WithTokenStore`. The store needs `github.com/jackc/pgx/v5`, which
+howdah now depends on directly: nothing links unless it is imported, but it is
+in the module graph of every consumer.
+
+**New (sealing from outside the package):** `howdah.SessionSealer` and
+`howdah.KeyID`, so a store in another package can seal the handle it puts in
+the cookie and the payload it puts in its own storage. The domains a value is
+sealed under stay behind the constructor, because a hand-written one is the
+cross-cookie replay the domain exists to prevent.
+
 **Behaviour change (`WithMaxSessionAge`):** it configures the store howdah
 builds for itself, so passing it together with `WithTokenStore` is now a
 startup error rather than an option that quietly does nothing. A store brings
 its own session lifetime.
+
+**Migrations (`pgstore`):** the table comes from tern migrations howdah
+carries, tracked in a version table of its own — `howdah_session_version` —
+so howdah's numbering cannot collide with the application's. **Apply them
+from a deliberate step, never from the service's startup path:**
+`pgstore.Migrate(ctx, pool)`, or `pgstore.Migrations` for tooling that would
+rather do it itself. Two jobs the application schedules, since howdah starts
+no goroutines: `DeleteExpired` sweeps expired sessions, and `Rekey` re-seals
+the table under the current key during a rollover, which turns step 3 of the
+rollover runbook from "wait out the maximum session age" into a sweep. Call
+either until it returns 0.
+
+**Build:** the minimum Go version is now 1.26.5, raised by the
+`github.com/ttab/mage` targets howdah's magefiles import. A consumer on Go
+1.25 has to upgrade the toolchain before upgrading howdah.
 
 Changes:
 
@@ -40,10 +73,16 @@ Changes:
   `howdah.NewSession` and `howdah.StoredToken`, for the `id_token_hint` that
   RP-initiated logout will need, but the cookie-backed store drops it: another
   JWT does not fit in the roughly 1.5 KB a store-less session has left.
-- Documentation: the README has a "Where sessions live" section, and
-  `docs/architecture.md` describes the read and refresh path through a store,
-  including why the session cookie is rewritten when the handle changed *or*
-  when the value came in under a retired key.
+- howdah has a `magefiles` directory for the first time, for `sql:generate`
+  and `docs:links`, and an `sqlc.yaml` — every query pgstore runs is compiled
+  by sqlc from `tokenstore/pgstore/postgres/queries.sql`. The store's tests
+  run against a real Postgres in Docker through `github.com/ttab/eltest`.
+- Documentation: the README has "Where sessions live" and "Keeping sessions in
+  Postgres" sections, and `docs/architecture.md` describes the read and
+  refresh path through a store — including why the session cookie is rewritten
+  when the handle changed *or* when the value came in under a retired key, and
+  how the refresh lease serialises an exchange without holding a transaction
+  across the round trip to the provider.
 
 ## [v0.2.0] - 2026-08-31
 

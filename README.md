@@ -261,6 +261,59 @@ it holds under a new key without waiting for sessions to expire. howdah
 starts no goroutines of its own, so an application that wants expired
 sessions swept calls `DeleteExpired` on a schedule of its own.
 
+### Keeping sessions in Postgres
+
+`howdah/tokenstore/pgstore` is the store for an application that has a
+database. The cookie then holds a sealed handle of about ninety bytes, the
+tokens live in a row sealed under the same keyring, and the row id is
+`sha256` of the handle — so a database dump yields nothing anybody can log in
+with, and a sealed payload cannot be moved from one session's row to
+another's.
+
+```go
+store, err := pgstore.New(pool, keyring, "token")
+if err != nil {
+    return fmt.Errorf("create the session store: %w", err)
+}
+
+auth, err := howdah.NewOIDCAuth(provider, verifier, oauth2Conf, keyring,
+    howdah.WithSessionCookieName("token"), // the same name the store took
+    howdah.WithTokenStore(store),
+)
+```
+
+What the row buys: logout is a revocation rather than a cleared cookie,
+`DeleteSubject` logs one person out of every browser at once, the absolute
+expiry is a column the server checks, and a refresh is **serialised across
+the fleet** — the several requests of a page load collapse onto one token
+endpoint round trip however many replicas they land on, which is what makes
+it safe to turn refresh token rotation on at the provider.
+
+| Option | Effect |
+|---|---|
+| `WithMaxSessionAge` | The absolute session lifetime. Defaults to `DefaultMaxSessionAge`. |
+| `WithRefreshLease` | How long a refresher holds the right to call the token endpoint. Must be longer than the token request timeout, and is what the next caller waits out if a refresher dies mid-exchange. |
+| `WithTokenRequestTimeout` | Bounds the token endpoint round trip, which runs detached from the request. |
+| `WithRefreshMargin` | How little life an access token may have left for a concurrent refresh's result to be used as-is. |
+| `WithRefreshWait` | How long a caller waits for another caller's refresh before failing with `ErrRefreshTimeout`. |
+| `WithWriteTimeout` | Bounds the writes that must happen even though the request is gone: recording a refresh, and recording that one failed. |
+
+**The migrations are the application's to run, never the service's to run at
+startup** — a migration at startup turns every restart, scale-up and rollback
+into a schema change. `pgstore.Migrate(ctx, pool)` applies them from
+wherever the application already migrates, and it tracks its version in
+`howdah_session_version` so howdah's numbering cannot collide with the
+application's own. `pgstore.Migrations` is the embedded `fs.FS` for tooling
+that would rather do it itself.
+
+Two jobs the application schedules, because howdah starts no goroutines:
+`DeleteExpired(ctx, batch)` sweeps sessions past their expiry, and
+`Rekey(ctx, batch)` re-seals the table under the current key during a key
+rollover — which is step 3 of the [rollover
+runbook](docs/cookies.md#11-rolling-a-key-over), and the difference between
+retiring a key today and retiring it after the longest possible session. Call
+either until it returns 0.
+
 ### Options
 
 | Option | Effect |

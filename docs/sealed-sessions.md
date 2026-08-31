@@ -4,20 +4,34 @@ Encrypt howdah's session cookie under a rotatable keyring, move the tokens
 behind a `TokenStore` so refreshes have a single winner, and upstream the
 cookie hardening imagereporting is currently carrying downstream.
 
-> **This is a working document, not documentation.** It is kept because
-> sections 6, 7 and parts of 10 and 11 still describe unbuilt v0.3.0 work.
-> Everything about v0.2.0 in here has shipped, and so has §5's interface, and
-> where it disagrees with the documentation set the set wins — some figures in
-> here were estimates that a real measurement has since corrected. Delete this
-> file when the Postgres-backed store lands and open decision 5 is answered.
+> **This is a working document, not documentation.** Everything it proposes
+> has now been built, and where it disagrees with the documentation set the
+> set wins — some figures in here were estimates that a real measurement has
+> since corrected, and the implementation settled several details this
+> document only sketched. It is kept because open decision 5 is still open,
+> and because the reasoning behind the refresh lease is worth having in one
+> place. Delete it when logout revokes at the provider.
 
 | | |
 |---|---|
-| Status | v0.2.0 shipped; v0.3.0 in progress — the interface and the cookie-backed store have landed |
-| Shipped | §1–4, §8, §9, the v0.2.0 half of §12, and §5's interface, `cookiestore` and `Rekeyer` |
-| Still live | §6 serialising refresh, §7 schema and migrations, §10's store tests, and open decision 5 |
+| Status | v0.2.0 and v0.3.0 shipped; §1–10 are built |
+| Shipped | all of §1–10, including §5's interface, the cookie-backed store, §6's refresh lease, §7's schema and migrations, and §10's store tests |
+| Still live | [§11's open decisions 4 and 5](#11-open-decisions). The build followed 4's recommendation — one module, pgx in every consumer's `go.sum` — and 5 is untouched: nothing talks to the provider on logout. |
 | Documented properly in | [cookies.md](cookies.md), [architecture.md](architecture.md), [README](../README.md#where-sessions-live) |
 | Superseded figures | §5's cookie sizes — measured at 2453 B, not the 3527 first estimated |
+
+### What the implementation of §6 and §7 added
+
+The lease, the schema and the sweep are built as described, plus five things
+this document does not mention and each of which is load-bearing:
+
+| Addition | Why |
+|---|---|
+| `refresh_failed_at` is in the lease's own predicate, not only read by the losers | A loser that read the row before the winner failed and asked for the lease after it would otherwise find the lease free and exchange the same refresh token again, which is the *n* attempts per outage the column exists to prevent. |
+| The write-back runs on a detached context too, not just the exchange | The provider has already acted by then, so a client that disconnects between the two takes the rotated token with it. |
+| The whole of `Refresh` is bounded by one deadline | Every path back to the top of its loop is a wait for somebody else, including a lost write-back, so the budget belongs to the call rather than to each branch. |
+| `Rekey` deletes a payload that will not open | It is a session nobody can use, and skipping it would leave it in the set the sweep selects, so "call until it returns 0" would never terminate. |
+| `SessionSealer` in the root package | §5 settled that stores seal, but the unexported `seal`/`open` pair cannot be reached from a subpackage; the sealer exports both halves with the domains behind a constructor, so a hand-written domain is still impossible. |
 
 ### What §5 settled, and how
 
