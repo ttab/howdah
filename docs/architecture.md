@@ -1,0 +1,197 @@
+# Architecture
+
+How howdah is put together, for somebody about to change it. The README is
+the reference for using it; this is the design authority for the internals and
+the request flows.
+
+| Document | What it settles |
+|---|---|
+| [README](../README.md) | Orientation and the working reference: what the package holds, how to wire an application up, and every option it takes. |
+| **architecture.md** (this document) | The internals: the render pipeline, the hook system, and the OIDC flow. |
+| [cookies.md](cookies.md) | The cookie and session contract: sealing, the keyring, rotation, and every way a session ends. |
+
+It does not cover the cookie format or key rotation — those are
+[cookies.md](cookies.md) — nor the API surface, which is the README.
+
+## The shape of it
+
+Everything hangs off `NewApplication`, which is deliberately thin: it loads
+locales, builds a `PageRenderer`, wraps the caller's `http.ServeMux` in a
+`PageMux`, registers the asset server, and calls `RegisterRoutes` on each
+component. It owns no request handling of its own beyond `/set-language`.
+
+**The framework has no plugin registry and no lifecycle.** A component is
+whatever implements `Component`, and the optional interfaces are discovered by
+type assertion at construction time, once. That is why adding a capability to
+howdah means adding an interface a component may implement, rather than a
+registration call — and why a component that implements an interface howdah
+does not know about is silently inert.
+
+```
+NewApplication
+  │
+  ├─ load locale.<lang>.toml from the locales FS ──→ i18n.Bundle
+  ├─ NewPageRenderer(templates, bundle, components)
+  │     └─ collects template funcs from every TeplateFuncSource
+  ├─ NewPageMux(renderer, serveMux)
+  ├─ register GET /assets/  (http.FileServerFS, prefix stripped)
+  ├─ register GET /set-language
+  └─ for each component:
+        ├─ RegisterRoutes(pageMux)
+        └─ if ComponentObserver: ObserveComponent(every component)
+```
+
+`ObserveComponent` is called with every component including the observer
+itself, so an observer that cares has to filter itself out.
+
+## The request pipeline
+
+`PageMux` exists so that a handler returns *what to render* rather than
+writing bytes. That single decision is what makes error pages, titles, menus
+and breadcrumbs uniform without every handler remembering them.
+
+```
+http.ServeMux
+  │
+  ▼
+PageMux.Handle
+  │
+  ├─ handler(ctx, w, r) → (*Page, error)
+  │     │
+  │     ├─ error is ErrSkipRender  ──→ return, write nothing
+  │     │      (the handler already wrote: a redirect, a file download)
+  │     │
+  │     ├─ other error ──→ AsHTTPError ──→ renderer.ErrorPage
+  │     │      (an untyped error becomes 500)
+  │     │
+  │     └─ *Page ──→ renderer.RenderPage
+  │                    ├─ resolve language (cookie, then Accept-Language, then en)
+  │                    ├─ collect menu from every MenuHook, then Alter hooks
+  │                    ├─ mark the active menu item by matching r.URL.Path
+  │                    └─ execute Page.Template with the i18n funcs bound
+```
+
+**`PageMux` does not authenticate anything.** There is no route-level auth
+hook: a handler that needs a session calls `RequireAuth` itself. That is a
+deliberate trade — it means a new route can be added without a session check
+and nobody notices — and the way applications close it is to wrap the
+`Authenticator` they hand their components, so the check is in one place they
+control rather than in howdah. imagereporting's `RoleAuth` is the worked
+example: it wraps howdah's authenticator, adds a realm-role requirement, and
+components never see the unwrapped one.
+
+## The hook system
+
+`Hooks[D, T]` is two-phase on purpose. Build hooks contribute; alter hooks see
+the whole collected list and can rewrite it.
+
+```
+Collect()  → every RegisterHook fn, concatenated, sorted by Weight
+Alter(...) → every RegisterAlter fn in turn, each handed the full list
+```
+
+The split is what lets a component hide or reorder another component's menu
+item without knowing which component contributed it — a build hook cannot,
+because it only ever returns its own items. Alter hooks receive an
+`AlterContext[D]` carrying the request, so the decision can depend on who is
+asking.
+
+Menus are the only user of `Hooks` today. The type is generic because the
+second user was expected and the shape is the interesting part.
+
+## Language resolution
+
+Three sources, in order: the `lang` cookie, the `Accept-Language` header,
+English. The cookie is written only by `GET /set-language`, which is
+registered by `NewApplication` rather than by a component, because a language
+switch that only works on pages a particular component serves is not a
+language switch.
+
+That endpoint takes a `redirect` parameter, and it is client-supplied input
+that goes into a `Location` header. It is refused unless it is an absolute
+path within the application; anything a browser would resolve against another
+origin falls back to the application root. **This was an open redirect until
+v0.2.0** — the value went into the header unvalidated — and the fix also
+resolves it against the base path, which the raw value did not, so a
+prefix-mounted application used to send the visitor to the server root.
+
+## The OIDC flow
+
+```
+  GET /any-protected-page
+    │  RequireAuth: no usable session
+    ▼
+  302 → GET /auth/login?redirect=<app-relative path>
+    │  renders login.html, Contents = LoginPage{Failed: …}
+    ▼
+  POST /auth/login
+    │  mint state + nonce, seal the redirect target into auth_redir
+    │  all three scoped to <base>/auth, single-use
+    ▼
+  302 → the provider's authorize endpoint
+    │
+    ▼
+  GET /auth/callback?code=…&state=…      (cross-site top-level navigation:
+    │                                     which is why SameSite is Lax)
+    ├─ read state, nonce, auth_redir, then clear all three
+    ├─ compare state
+    ├─ exchange the code               ─┐
+    ├─ verify the ID token              │ any failure from here on:
+    ├─ compare the nonce                │ log at warn, 302 to the login
+    ├─ WithOnLogin callback, if any     │ page with ?login_failed=1
+    ├─ seal the session, set the cookie ─┘ (never an error page — see
+    └─ 302 → the redirect target             cookies.md §10)
+```
+
+**The callback cookies are cleared as they are read, before the state
+comparison.** Every path below that point ends the attempt, and a value left
+behind is one the next callback picks up — an abandoned attempt's redirect
+target would otherwise hijack the landing page of a later login started
+without one. Clearing before the comparison means a forced navigation to the
+callback costs the visitor the login button again, which is the better half of
+the trade.
+
+`state` and `nonce` are not sealed. They are random values whose only job is
+to be compared against what the provider echoes back, so rewriting either one
+makes the comparison fail; sealing them would buy nothing. `auth_redir` is
+sealed because it is a value the application acts on. This is settled — see
+cookies.md §1.
+
+Refresh, the session age cap and `Keepalive` are
+[cookies.md §9](cookies.md#9-what-ends-a-session).
+
+## Mounting under a path prefix
+
+`BasePath` is a component that carries the mount point and contributes the
+`{{base_path}}` template function. It is a `string` rather than a struct so
+that the zero value is the root mount and costs nothing.
+
+The problem it solves is that `http.StripPrefix` makes the application blind
+to its own prefix: `r.URL.Path` is stripped, so anything howdah emits *for the
+browser* — redirects, cookie paths, menu hrefs — would point at the server
+root. Everything that builds such a URL goes through `BasePath.Path`, and
+`WithBasePath` is what tells `OIDCAuth` about it.
+
+**A prefixed application must also be told its own cookie name.** Cookies are
+scoped by host and path, and not by port, so two applications on one host —
+including two on different ports of `localhost` — share a cookie jar and will
+overwrite each other's sessions under the default name. `WithSessionCookieName`
+is not optional in that arrangement, and it doubles as the sealing domain, so
+two applications can share a keyring without being able to open each other's
+sessions.
+
+## Pending work
+
+- **No server-side session store.** Sessions live entirely in the cookie, so
+  logout clears one browser and revokes nothing, a copied cookie value works
+  until the session age cap, and refresh deduplication cannot reach across
+  replicas. A `TokenStore` interface with a Postgres implementation is the
+  planned answer, and it also turns key retirement from "wait out the maximum
+  session age" into a re-key sweep.
+- **Nothing talks to the provider on logout.** No RFC 7009 revocation and no
+  RP-initiated logout, so a session howdah ends leaves a live refresh token at
+  the provider. The `id_token` needed for `id_token_hint` is not persisted
+  either: `json.Marshal` drops `oauth2.Token`'s `Extra` map.
+- **`ErrWrongSessionKind` is reserved.** Nothing writes handle-kind envelopes
+  yet; the byte and the error exist so the store can be added without a
+  release in which the two shapes are indistinguishable.

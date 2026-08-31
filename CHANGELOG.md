@@ -31,8 +31,27 @@ plain HTTP — local development, in practice — must pass
 Applications that were adding these attributes with a response wrapper of
 their own can drop it.
 
+**Behaviour change (failed logins):** a login that does not complete now
+redirects to the login page with `?login_failed=1` instead of rendering an
+error page at the callback URL. That URL still carries the authorization code,
+so an error page there was one a reload re-submitted, and the provider's reply
+to a redeemed code — `invalid_grant "Code not valid"` — replaced the real
+reason and made a recoverable failure look permanent. The login page's
+`Page.Contents` is now a `howdah.LoginPage` whose `Failed` field says the last
+attempt did not complete, so a template can show a notice; one that ignores
+`Contents` renders as before. A provider that denies the login outright still
+gets its own error page, since no code was issued and its description is
+actionable.
+
 Changes:
 
+- A session cookie too large for a browser to store is refused rather than
+  written. A browser drops an oversized cookie silently, so this previously
+  presented as a login that reported success and returned the user to the
+  login page with nothing logged anywhere. The refusal names the size and the
+  limit. A measured session cookie is around 2.5 KB against the 4096 bytes a
+  browser guarantees, so this is a guard rather than a limit most deployments
+  will meet.
 - Fixed an open redirect in the `/set-language` endpoint: the `redirect` query
   parameter went into the `Location` header unvalidated, so a crafted link
   made the application's own origin hand visitors to another site. The value
@@ -66,8 +85,10 @@ Changes:
   the startup line naming the sealing key.
 - Added `golang.org/x/sync` v0.22.0 as a dependency, for the refresh
   deduplication.
-- Documented the cookie key format, the rotation runbook and the reasoning
-  behind the cookie attributes in the README.
+- Reorganised the documentation: `docs/cookies.md` is now the authority on
+  cookies and sessions, `docs/architecture.md` on howdah's internals and the
+  OIDC flow, and the README is orientation and the working reference. The
+  cookie material was about a third of the README.
 
 ## [v0.1.0] - 2026-05-25
 
