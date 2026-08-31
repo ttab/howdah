@@ -94,13 +94,24 @@ DELETE FROM howdah_session
 WHERE id IN (
   SELECT id FROM howdah_session
   WHERE expires_at <= now()
+  ORDER BY expires_at, id
   LIMIT $1
+  FOR UPDATE SKIP LOCKED
 )
 `
 
 // Deletes at most batch sessions that are past their absolute expiry. The
 // subselect is what bounds the delete: an unbounded one takes a lock on
 // every dead row in the table at once.
+//
+// FOR UPDATE SKIP LOCKED and the ORDER BY are what make two replicas
+// sweeping at the same time behave. Without them the second sweeper's
+// statement snapshot selects the very rows the first is deleting, blocks on
+// its locks, and then finds every one of them gone — so it reports 0 with
+// rows still in the table and stops short. And a LIMIT with no ORDER BY
+// leaves the lock order to the plan, so two deletes that take their rows in
+// opposite orders deadlock and abort the sweep outright. Skipping the locked
+// rows instead gives each sweeper a disjoint batch.
 func (q *Queries) DeleteExpiredSessions(ctx context.Context, batch int32) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteExpiredSessions, batch)
 	if err != nil {

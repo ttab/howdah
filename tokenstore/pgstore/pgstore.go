@@ -16,9 +16,13 @@
 //     what makes it safe to turn refresh token rotation on at the provider:
 //     without it the first exchange invalidates the refresh token and every
 //     other request comes back invalid_grant and bounces the user to login.
-//   - **A key rollover that does not have to wait.** Rekey re-seals the
-//     table under the current key, so a retired key can be dropped as soon
-//     as the sweep finishes rather than after the longest possible session.
+//   - **A key rollover a retired key cannot spoil.** A stored session is
+//     sealed in two places, and only the handle in the cookie is re-sealed
+//     by the request that carries it; the row moves when a refresh writes
+//     it, which is to say never for a session nobody is using. Rekey
+//     re-seals the rows, so dropping the old key costs the idle sessions
+//     their cookie and nothing else. It does not make that wait shorter —
+//     nothing reaches a cookie in a browser that sends no requests.
 //
 // The cookie holds a sealed handle of about ninety bytes; the tokens live in
 // the row, sealed under the same keyring, and the row id is sha256 of the
@@ -54,10 +58,11 @@ const (
 	DefaultMaxSessionAge = howdah.DefaultMaxSessionAge
 
 	// DefaultRefreshLease is how long a refresher holds the right to do
-	// the token endpoint round trip. It has to be longer than
-	// DefaultTokenRequestTimeout, or a refresher can lose its lease while
-	// still legitimately waiting for the provider — see WithRefreshLease.
-	DefaultRefreshLease = 15 * time.Second
+	// the token endpoint round trip and write the result back. It has to
+	// outlast DefaultTokenRequestTimeout plus DefaultWriteTimeout
+	// together, or a refresher can lose its lease while still legitimately
+	// working — see WithRefreshLease.
+	DefaultRefreshLease = 20 * time.Second
 
 	// DefaultTokenRequestTimeout bounds the token endpoint round trip.
 	DefaultTokenRequestTimeout = 10 * time.Second
@@ -95,13 +100,26 @@ const (
 // session rather than one per request. Without the refresh_failed_at column
 // behind it, every waiting caller would poll a refreshed_at that never
 // moves, burn its whole backoff, and then attempt an exchange of its own.
-var ErrRefreshFailed = errors.New("a concurrent refresh of the session failed")
+//
+// It wraps howdah.ErrRefreshRejected, which is what tells OIDCAuth that this
+// is a session to end rather than a store to retry. The caller that ran the
+// exchange gets the provider's own error, already wrapping the same sentinel;
+// a caller that only waited never saw it, so the store supplies it.
+var ErrRefreshFailed = fmt.Errorf(
+	"%w: a concurrent refresh of the session failed",
+	howdah.ErrRefreshRejected)
 
 // ErrRefreshTimeout is what a caller gets when it waited out its budget
 // without the refresh it was waiting for either landing or failing. The
 // refresher it was waiting for is neither finished nor timed out, which in
 // practice means a process that died while holding the lease and a lease
 // that has not expired yet.
+//
+// It deliberately does **not** wrap howdah.ErrRefreshRejected. Nothing here
+// says the session is over — the row is intact, and by the time the caller
+// reads this another caller may already have refreshed it — so the request
+// fails and the next one tries again, rather than the user being logged out
+// of a session that was never in danger.
 var ErrRefreshTimeout = errors.New("timed out waiting for a concurrent refresh")
 
 // DB is what pgstore reads and writes through: a *pgxpool.Pool, a *pgx.Conn,
@@ -157,16 +175,18 @@ func WithMaxSessionAge(age time.Duration) Option {
 	}
 }
 
-// WithRefreshLease sets how long a refresher holds the right to do the token
-// endpoint round trip.
+// WithRefreshLease sets how long a refresher holds the right to refresh the
+// session: the token endpoint round trip **and the write-back afterwards**,
+// which is the half that is easy to forget. The lease has to cover both, so
+// it must be longer than the token request timeout plus the write timeout
+// added together, and New refuses a store where it is not.
 //
-// It must be longer than the token request timeout, and New refuses a store
-// where it is not. The lease is what a caller waits out when the refresher
-// holding it died, so it is also the worst case one request pays for a
-// process that was killed mid-exchange: too long makes that request slow,
-// and too short lets a refresher that is still waiting for a slow provider
-// lose its lease to a second caller, which posts the same refresh token
-// again.
+// The lease is what a caller waits out when the refresher holding it died,
+// so it is also the worst case one request pays for a process that was
+// killed mid-exchange: too long makes that request slow, and too short lets
+// a refresher that is still legitimately working lose its lease to a second
+// caller, which posts the same refresh token again. With refresh token
+// rotation on, that second exchange is the one that ends the session.
 func WithRefreshLease(lease time.Duration) Option {
 	return func(c *conf) {
 		c.refreshLease = lease
@@ -174,8 +194,18 @@ func WithRefreshLease(lease time.Duration) Option {
 }
 
 // WithTokenRequestTimeout bounds the token endpoint round trip. The exchange
-// runs on a context detached from the request, so this is the only thing
-// that stops it.
+// runs on a context detached from the request, so nothing the client does
+// stops it and this is the budget it gets — an upper bound, since the
+// exchange is the caller's own function and may hold itself to something
+// shorter. howdah's does: OIDCAuth caps a refresh at ten seconds and honours
+// whichever of the two deadlines comes first.
+//
+// It is also half of what sizes the refresh lease, so lowering it is not
+// only a matter of how long a request waits: see WithRefreshLease.
+//
+// An exchange that ignores its context entirely is beyond the store's reach,
+// and a lease sized against a timeout nothing honours is a lease a second
+// caller can take while the first is still exchanging.
 func WithTokenRequestTimeout(timeout time.Duration) Option {
 	return func(c *conf) {
 		c.tokenRequestTimeout = timeout
@@ -289,14 +319,21 @@ func (c conf) validate() error {
 			c.refreshMargin)
 	}
 
-	// A lease that expires while its holder is still legitimately waiting
-	// for the provider is a lease that lets a second caller post the same
-	// refresh token, which is the whole failure this store exists to
-	// prevent.
-	if c.refreshLease <= c.tokenRequestTimeout {
+	// A lease that expires while its holder is still legitimately working
+	// is a lease that lets a second caller post the same refresh token,
+	// which is the whole failure this store exists to prevent.
+	//
+	// The window the lease has to cover is the round trip *and* the
+	// write-back, not the round trip alone: the refresher holds the lease
+	// from the moment it takes it until CommitRefresh lands, so a lease
+	// that only outlasts the exchange expires while the winner is still
+	// committing. The winner's own write is safe either way — the nonce
+	// fence rejects it — but the duplicate exchange the expired lease
+	// authorised in the meantime is not.
+	if window := c.tokenRequestTimeout + c.writeTimeout; c.refreshLease <= window {
 		return fmt.Errorf(
-			"the refresh lease (%s) must be longer than the token request timeout (%s)",
-			c.refreshLease, c.tokenRequestTimeout)
+			"the refresh lease (%s) must be longer than the token request timeout (%s) and the write timeout (%s) together, which is what it has to cover",
+			c.refreshLease, c.tokenRequestTimeout, c.writeTimeout)
 	}
 
 	return nil
@@ -540,7 +577,16 @@ func (s *Store) DeleteSubject(
 // The application schedules it. An application that already depends on
 // elephantine can wrap it in pg.RunInJobLock so that only one replica
 // sweeps; one that does not can run it on a ticker and let the replicas
-// overlap, which is harmless — a row can only be deleted once.
+// overlap.
+//
+// Overlapping sweeps are safe but not necessarily complete on either
+// replica. The batch is selected FOR UPDATE SKIP LOCKED in a deterministic
+// order, so two sweepers take disjoint batches rather than deadlocking or
+// both finding their rows deleted under them — but a sweeper whose remaining
+// rows are all locked by the other returns 0 with rows still in the table,
+// and the other one deletes them. Which is to say: 0 means "nothing here for
+// me right now", not "the table is clean". For a single sweeper, which is
+// what a job lock gives, it means both.
 func (s *Store) DeleteExpired(
 	ctx context.Context, batch int,
 ) (int64, error) {

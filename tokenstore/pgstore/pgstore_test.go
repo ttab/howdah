@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -302,6 +304,105 @@ func TestDeleteExpiredBatches(t *testing.T) {
 	}
 }
 
+// TestDeleteExpiredConcurrentSweepers covers the sweep an application runs
+// on a ticker rather than behind a job lock, which is the arrangement the
+// documentation calls harmless: several replicas sweeping the same table at
+// the same time.
+//
+// It is only harmless because the batch is taken FOR UPDATE SKIP LOCKED in a
+// deterministic order. Without that, one sweeper's statement selects the rows
+// the other is deleting, waits for its locks and then finds them all gone —
+// so it reports 0 while the table still holds expired rows and stops short —
+// and two deletes taking their rows in opposite orders deadlock outright.
+// Here every row has to be deleted and counted exactly once, by somebody.
+func TestDeleteExpiredConcurrentSweepers(t *testing.T) {
+	pool := testDB(t)
+	store := testStore(t, pool, testKeyring(t),
+		pgstore.WithMaxSessionAge(200*time.Millisecond))
+
+	const (
+		sessions = 24
+		sweepers = 4
+		batch    = 3
+	)
+
+	for i := range sessions {
+		_, err := store.Create(t.Context(), howdah.NewSession{
+			Subject: fmt.Sprintf("user-%d", i),
+			Token:   testToken("access", time.Hour),
+		})
+		if err != nil {
+			t.Fatalf("create session %d: %v", i, err)
+		}
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	var (
+		swept atomic.Int64
+		wg    sync.WaitGroup
+		errs  = make([]error, sweepers)
+	)
+
+	wg.Add(sweepers)
+
+	for s := range sweepers {
+		go func() {
+			defer wg.Done()
+
+			for {
+				deleted, err := store.DeleteExpired(
+					t.Context(), batch)
+				if err != nil {
+					errs[s] = err
+
+					return
+				}
+
+				if deleted == 0 {
+					return
+				}
+
+				if deleted > batch {
+					errs[s] = fmt.Errorf(
+						"swept %d sessions in one pass of %d",
+						deleted, batch)
+
+					return
+				}
+
+				swept.Add(deleted)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	for s, err := range errs {
+		if err != nil {
+			t.Errorf("sweeper %d: %v", s, err)
+		}
+	}
+
+	// A sweeper may well return 0 with rows left — the ones it can see are
+	// locked by another sweeper that is about to delete them — so the
+	// contract is that between them they account for every row, not that
+	// each of them saw the table empty.
+	if got := swept.Load(); got != sessions {
+		t.Errorf("the sweepers deleted %d sessions between them, want %d",
+			got, sessions)
+	}
+
+	left, err := store.DeleteExpired(t.Context(), sessions)
+	if err != nil {
+		t.Fatalf("sweep once the others have finished: %v", err)
+	}
+
+	if left != 0 {
+		t.Errorf("%d expired sessions were left behind", left)
+	}
+}
+
 func TestDeleteSubject(t *testing.T) {
 	pool := testDB(t)
 	store := testStore(t, pool, testKeyring(t))
@@ -369,6 +470,14 @@ func TestPayloadIsBoundToItsRow(t *testing.T) {
 		handles = append(handles, session.Handle)
 	}
 
+	// Hand-written SQL, deliberately, and the only statements in the
+	// package that are: every query the store runs is compiled by sqlc
+	// from queries.sql, and this test needs two statements no production
+	// query may ever have. This one reads the sealed payloads the store
+	// keeps to itself; the write below transplants one row's payload into
+	// another's, which is precisely the tamper this test exists to prove
+	// impossible, so it has no business being expressible through the
+	// store's own query set.
 	rows, err := pool.Query(t.Context(),
 		"SELECT id, payload FROM howdah_session ORDER BY subject")
 	if err != nil {
@@ -408,6 +517,8 @@ func TestPayloadIsBoundToItsRow(t *testing.T) {
 	for i, r := range stored {
 		other := stored[(i+1)%len(stored)]
 
+		// The tamper itself: see the note above on why this is written
+		// by hand and must stay out of queries.sql.
 		_, err := pool.Exec(t.Context(),
 			"UPDATE howdah_session SET payload = $1 WHERE id = $2",
 			other.payload, r.id)
@@ -463,6 +574,21 @@ func TestNewRefusesABadConfiguration(t *testing.T) {
 			want: "must be longer than the token request timeout",
 		},
 		{
+			// A lease that only outlasts the round trip expires
+			// while the winner is still committing, and the
+			// duplicate exchange it lets a second caller make is
+			// the failure the lease exists to prevent.
+			name:    "with a lease that does not cover the write-back",
+			keyring: keyring,
+			cookie:  "token",
+			opts: []pgstore.Option{
+				pgstore.WithRefreshLease(11 * time.Second),
+				pgstore.WithTokenRequestTimeout(10 * time.Second),
+				pgstore.WithWriteTimeout(5 * time.Second),
+			},
+			want: "the write timeout",
+		},
+		{
 			name:    "with a zero session age",
 			keyring: keyring,
 			cookie:  "token",
@@ -489,6 +615,26 @@ func TestNewRefusesABadConfiguration(t *testing.T) {
 	}
 }
 
+// TestRefreshErrorsSayWhetherTheSessionIsOver pins which of the store's
+// refresh failures end a session and which are worth retrying, because
+// OIDCAuth decides whether to clear the session cookie on exactly that. In
+// store mode the cookie is the only handle to the row, so getting this
+// backwards turns a database blip into a logout for every user inside the
+// refresh margin.
+func TestRefreshErrorsSayWhetherTheSessionIsOver(t *testing.T) {
+	if !errors.Is(pgstore.ErrRefreshFailed, howdah.ErrRefreshRejected) {
+		t.Error("ErrRefreshFailed does not wrap howdah.ErrRefreshRejected, so a caller waiting on a refused exchange keeps a cookie it cannot use")
+	}
+
+	if errors.Is(pgstore.ErrRefreshTimeout, howdah.ErrRefreshRejected) {
+		t.Error("ErrRefreshTimeout wraps howdah.ErrRefreshRejected, which would log a user out of a session that is still there")
+	}
+
+	if errors.Is(pgstore.ErrRefreshTimeout, howdah.ErrNoSession) {
+		t.Error("ErrRefreshTimeout wraps howdah.ErrNoSession, which would log a user out of a session that is still there")
+	}
+}
+
 func TestNewRefusesAMissingDatabase(t *testing.T) {
 	_, err := pgstore.New(nil, testKeyring(t), "token")
 	if err == nil {
@@ -498,6 +644,11 @@ func TestNewRefusesAMissingDatabase(t *testing.T) {
 
 // keyIDs reads the key ids the rows are sealed under, so a test can check
 // what a rollover sweep did.
+//
+// Hand-written for the reason TestPayloadIsBoundToItsRow gives: this is an
+// assertion about the state of the table rather than anything the store
+// does, and adding it to queries.sql would put a query nothing in the store
+// calls into the generated code.
 func keyIDs(t *testing.T, pool *pgxpool.Pool) map[string]int {
 	t.Helper()
 

@@ -14,11 +14,17 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// errLeaseLost is internal: it says the refresh went through but the
-// write-back was fenced out, so the result has to be discarded and the row
-// re-read. It never reaches a caller, because the reason the write was
-// fenced is that somebody else refreshed successfully.
+// errLeaseLost is internal: it says this refresher no longer owns the
+// refresh, so whatever it came back with — a token or a failure — has to be
+// discarded and the row re-read. It never reaches a caller, because the
+// reason the fence rejected the write is that somebody else's write landed.
 var errLeaseLost = errors.New("the refresh lease was lost")
+
+// maxLostWriteReads caps how many times one call may read past its own
+// deadline on the strength of a lost write-back. Each of those reads is
+// justified — the result it is looking for is committed already — but the
+// cap is what guarantees the loop ends whatever the traffic does.
+const maxLostWriteReads = 2
 
 // Refresh exchanges the session's refresh token for a new one, and does it
 // exactly once per session across the whole fleet however many requests ask
@@ -38,7 +44,12 @@ var errLeaseLost = errors.New("the refresh lease was lost")
 //  3. **The winner exchanges**, on a context detached from the request, and
 //     writes the result back fenced on its lease nonce. A write that comes
 //     back with no rows means the lease was lost and somebody fresher won;
-//     the result is discarded rather than committed over theirs.
+//     the result is discarded rather than committed over theirs, and the row
+//     is re-read even if the wait has run out, because the answer is
+//     committed already. **The same fence, read the same way, guards the
+//     failure write-back** — a refresher that has lost its lease must not
+//     report its own exchange failure, which under rotation is most likely
+//     the answer to a token the new owner has already rotated away.
 //  4. **The losers wait**, on a bounded backoff, and return as soon as
 //     refreshed_at has moved. They make no provider call. If the refresh
 //     they were waiting for failed, they see that and fail immediately
@@ -46,7 +57,10 @@ var errLeaseLost = errors.New("the refresh lease was lost")
 //     the provider may already have rotated.
 //  5. **A refresher that died** holds its lease until it expires, and then
 //     the next caller takes it over. That costs one slow request, not a
-//     wedged session.
+//     wedged session. The lease covers the round trip and the write-back
+//     together, so a refresher that is merely slow does not lose it — an
+//     expired lease that a live refresher still thinks it holds is what lets
+//     two callers post the same refresh token.
 //
 // The one window that cannot be closed: if the exchange succeeds and the
 // write-back then fails — the database was unreachable for the two seconds
@@ -73,6 +87,7 @@ func (s *Store) Refresh(
 		seenFailedAt    pgtype.Timestamptz
 		backoff         = refreshPollMin
 		deadline        = time.Now().Add(s.conf.refreshWait)
+		lostWriteReads  int
 	)
 
 	for pass := 0; ; pass++ {
@@ -82,8 +97,21 @@ func (s *Store) Refresh(
 		// call is bounded here rather than in each of them. A refresh
 		// that cannot be resolved inside the budget is a failed
 		// request, not an unbounded loop.
-		if pass > 0 && !time.Now().Before(deadline) {
+		//
+		// The one exception is the pass that follows a lost write-back,
+		// and it is an exception because that pass is not a wait at
+		// all. A write is fenced out only when somebody else's write
+		// landed, so the answer is already in the row and one read
+		// away: giving up on the budget here would return
+		// ErrRefreshTimeout — and cost the caller its session — over a
+		// token that is sitting there. The reads are counted so that a
+		// pathological run of lost leases still ends.
+		if pass > 0 && lostWriteReads == 0 && !time.Now().Before(deadline) {
 			return nil, ErrRefreshTimeout
+		}
+
+		if lostWriteReads > 0 {
+			lostWriteReads--
 		}
 
 		row, err := s.q.GetSession(ctx, id)
@@ -164,7 +192,10 @@ func (s *Store) Refresh(
 		if errors.Is(err, errLeaseLost) {
 			// The row now holds somebody else's newer tokens, and
 			// the next pass through the loop reads them. No wait:
-			// their write has already landed.
+			// their write has already landed, so the read is worth
+			// one pass past the deadline.
+			lostWriteReads = min(lostWriteReads+1, maxLostWriteReads)
+
 			continue
 		}
 
@@ -258,15 +289,29 @@ func (s *Store) runExchange(
 // error the caller is handed. A failure that cannot even be recorded is
 // reported alongside the one that caused it, because it is what turns a
 // provider outage into a stampede.
+//
+// The marker's own fence is read, not thrown away, and that is the
+// difference between one user staying logged in and one being bounced. Zero
+// rows means the nonce is gone, so this refresher no longer owns the
+// refresh: somebody else committed a token, failed the refresh, or took the
+// lease over. Its own exchange error then says nothing about the session —
+// most often it *is* invalid_grant, because the winner rotated the token
+// this attempt was posting — so it goes the same way a fenced-out success
+// goes: discarded, with the row re-read. Reporting it instead would clear
+// the cookie of a session that was refreshed a millisecond earlier.
 func (s *Store) refreshFailed(
 	ctx context.Context, id, nonce []byte, cause error,
 ) error {
 	err := fmt.Errorf("exchange the refresh token: %w", cause)
 
-	markErr := s.markRefreshFailed(ctx, id, nonce)
-	if markErr != nil {
+	rows, markErr := s.markRefreshFailed(ctx, id, nonce)
+
+	switch {
+	case markErr != nil:
 		return errors.Join(err, fmt.Errorf(
 			"record the failed refresh: %w", markErr))
+	case rows == 0:
+		return errLeaseLost
 	}
 
 	return err
@@ -274,27 +319,29 @@ func (s *Store) refreshFailed(
 
 // markRefreshFailed records that the attempt failed and releases the lease,
 // fenced on the nonce so that a refresher which has already lost its lease
-// cannot mark a fresher one's attempt as failed.
+// cannot mark a fresher one's attempt as failed. It returns how many rows
+// the fence let through, which is what tells the caller whether the failure
+// it is recording is still its own to report.
 //
 // It runs on a detached context because the failure it is recording may be
 // the request's own cancellation, and the callers waiting on the lease need
 // the answer either way.
 func (s *Store) markRefreshFailed(
 	ctx context.Context, id, nonce []byte,
-) error {
+) (int64, error) {
 	writeCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx), s.conf.writeTimeout)
 	defer cancel()
 
-	_, err := s.q.FailRefresh(writeCtx, postgres.FailRefreshParams{
+	rows, err := s.q.FailRefresh(writeCtx, postgres.FailRefreshParams{
 		ID:    id,
 		Nonce: nonce,
 	})
 	if err != nil {
-		return fmt.Errorf("mark the refresh as failed: %w", err)
+		return 0, fmt.Errorf("mark the refresh as failed: %w", err)
 	}
 
-	return nil
+	return rows, nil
 }
 
 // session builds the token a read hands back. The handle is the caller's own

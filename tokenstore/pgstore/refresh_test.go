@@ -143,9 +143,13 @@ func TestRefreshRunsExactlyOnce(t *testing.T) {
 // slow request, not a wedged session.
 func TestRefreshLeaseOutlivesAPanickingRefresher(t *testing.T) {
 	pool := testDB(t)
+	// The lease has to cover the round trip and the write-back together,
+	// which is why the write timeout is set here as well: the defaults
+	// would make the sum larger than this deliberately short lease.
 	store := testStore(t, pool, testKeyring(t),
 		pgstore.WithRefreshLease(700*time.Millisecond),
-		pgstore.WithTokenRequestTimeout(300*time.Millisecond))
+		pgstore.WithTokenRequestTimeout(300*time.Millisecond),
+		pgstore.WithWriteTimeout(300*time.Millisecond))
 
 	session, err := store.Create(t.Context(), howdah.NewSession{
 		Subject: "user-1",
@@ -313,6 +317,126 @@ func TestRefreshFailureIsRecorded(t *testing.T) {
 	if refreshed.Token.AccessToken != "access-2" {
 		t.Errorf("got the access token %q, want %q",
 			refreshed.Token.AccessToken, "access-2")
+	}
+}
+
+// TestRefreshReadsTheWinnersTokenAfterLosingTheLease covers the failure
+// path's half of the fence, and the deadline exemption that makes it worth
+// having.
+//
+// A refresher whose lease expires mid-exchange — a provider slower than its
+// budget, or a lease sized too tightly — comes back to a row somebody else
+// has already refreshed. Its own exchange very often failed *because* of
+// that: with rotation on, the winner rotated away the refresh token this
+// attempt was posting, so the provider answered invalid_grant. Reporting
+// that failure would clear the cookie of a session that was refreshed a
+// millisecond earlier, so the fence on FailRefresh has to be read the same
+// way the fence on CommitRefresh is: zero rows means "not mine any more,
+// discard it and re-read".
+//
+// The re-read also has to happen even though the wait has run out, which is
+// what the refresh wait here is short enough to prove: the answer is already
+// committed, so it is one read away rather than an unknown wait.
+func TestRefreshReadsTheWinnersTokenAfterLosingTheLease(t *testing.T) {
+	pool := testDB(t)
+	store := testStore(t, pool, testKeyring(t),
+		pgstore.WithRefreshLease(700*time.Millisecond),
+		pgstore.WithTokenRequestTimeout(300*time.Millisecond),
+		pgstore.WithWriteTimeout(300*time.Millisecond),
+		pgstore.WithRefreshWait(300*time.Millisecond))
+
+	session, err := store.Create(t.Context(), howdah.NewSession{
+		Subject: "user-1",
+		Token:   testToken("access-1", -time.Second),
+	})
+	if err != nil {
+		t.Fatalf("create the session: %v", err)
+	}
+
+	read, err := store.Get(t.Context(), session.Handle)
+	if err != nil {
+		t.Fatalf("get the session: %v", err)
+	}
+
+	var (
+		loser    sync.WaitGroup
+		outcome  *howdah.StoredToken
+		loserErr error
+	)
+
+	loser.Add(1)
+
+	go func() {
+		defer loser.Done()
+
+		outcome, loserErr = store.Refresh(t.Context(), read,
+			func(context.Context, *oauth2.Token) (*oauth2.Token, error) {
+				// A provider slower than the lease, and one that
+				// pays no attention to the context it was handed
+				// — which is the state of the world this has to
+				// survive rather than one it can prevent.
+				time.Sleep(1100 * time.Millisecond)
+
+				return nil, errors.New("invalid_grant")
+			})
+	}()
+
+	// Long enough that the lease has expired, so this caller takes it over
+	// while the first is still exchanging.
+	time.Sleep(800 * time.Millisecond)
+
+	winner, err := store.Refresh(t.Context(), read,
+		func(context.Context, *oauth2.Token) (*oauth2.Token, error) {
+			// Short-lived on purpose, so that the refresh at the
+			// end of the test has something to exchange rather than
+			// being answered by the idempotency guard.
+			return testToken("access-2", -time.Second), nil
+		})
+	if err != nil {
+		t.Fatalf("the second refresher: %v", err)
+	}
+
+	if winner.Token.AccessToken != "access-2" {
+		t.Fatalf("the second refresher got %q, want %q",
+			winner.Token.AccessToken, "access-2")
+	}
+
+	loser.Wait()
+
+	if loserErr != nil {
+		t.Fatalf("the refresher that lost its lease reported %v, want the winner's token",
+			loserErr)
+	}
+
+	if outcome.Token.AccessToken != "access-2" {
+		t.Errorf("the refresher that lost its lease came back with %q, want %q",
+			outcome.Token.AccessToken, "access-2")
+	}
+
+	// And the row was left alone: the discarded failure must not have
+	// marked a live session as failed, or the next caller fails fast on
+	// somebody else's dead attempt.
+	got, err := store.Get(t.Context(), session.Handle)
+	if err != nil {
+		t.Fatalf("get the session afterwards: %v", err)
+	}
+
+	if got.Token.AccessToken != "access-2" {
+		t.Errorf("the row holds %q, want %q",
+			got.Token.AccessToken, "access-2")
+	}
+
+	refreshed, err := store.Refresh(t.Context(), got,
+		func(context.Context, *oauth2.Token) (*oauth2.Token, error) {
+			return testToken("access-3", time.Hour), nil
+		})
+	if err != nil {
+		t.Fatalf("refresh the session afterwards: %v", err)
+	}
+
+	if refreshed.Token.AccessToken != "access-3" {
+		t.Errorf("the later refresh came back with %q, want %q",
+			refreshed.Token.AccessToken, "access-3")
 	}
 }
 

@@ -10,12 +10,16 @@ import (
 // Rekey re-seals at most batch sessions under the key the keyring seals with
 // now and returns how many rows it dealt with. Call it until it returns 0.
 //
-// This is what makes a key rollover finish in a minute rather than in a
-// session lifetime. Outstanding cookies cannot be swept, so a store-less
-// application has to keep a retired key in the keyring until the longest
-// possible session has aged out; a table can be swept, so once this returns
-// 0 the old key is only holding open the cookies themselves, which the
-// request path re-seals as it sees them.
+// It is the half of a key rollover that no request can do. A session is
+// sealed in two places: the handle in the cookie, which the request path
+// re-seals as it sees it, and the row, which is re-sealed only when a
+// refresh writes it — which is to say never for a session nobody is using.
+// Skipping the sweep therefore ends the sessions of users who were active,
+// whose cookies migrated while their rows did not. Once this returns 0 the
+// old key is holding open nothing but the cookies themselves, and those come
+// back with their next request or age out; a retired key still has to stay
+// in the keyring until it is acceptable to log out whoever has not been
+// back, exactly as it does for a store-less application.
 //
 // The rows are found through the key_id index rather than by opening every
 // payload to discover which key it used, which is why the key id is a column
