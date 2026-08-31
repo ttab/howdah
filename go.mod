@@ -9,6 +9,7 @@ require (
 	github.com/ttab/newsdoc v1.0.0
 	github.com/twitchtv/twirp v8.1.3+incompatible
 	golang.org/x/oauth2 v0.35.0
+	golang.org/x/sync v0.22.0
 	golang.org/x/text v0.34.0
 )
 

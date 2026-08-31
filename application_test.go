@@ -2,7 +2,7 @@ package howdah
 
 import "testing"
 
-func TestLanguageRedirect(t *testing.T) {
+func TestResolveRedirect(t *testing.T) {
 	cases := []struct {
 		name   string
 		base   BasePath
@@ -27,9 +27,9 @@ func TestLanguageRedirect(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := languageRedirect(c.base, c.target)
+			got := resolveRedirect(c.base, c.target)
 			if got != c.want {
-				t.Errorf("languageRedirect(%q, %q) = %q, want %q",
+				t.Errorf("resolveRedirect(%q, %q) = %q, want %q",
 					c.base, c.target, got, c.want)
 			}
 		})
