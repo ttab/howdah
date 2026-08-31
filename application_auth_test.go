@@ -1189,3 +1189,87 @@ func TestAuthDefaultsUnchangedAtRoot(t *testing.T) {
 		}
 	}
 }
+
+// TestCallbackFailureRedirectsToLogin covers the trap that made a real
+// failure look permanent: an error page rendered at the callback URL is one a
+// reload re-submits, and a provider asked twice about the same authorization
+// code answers "code not valid", replacing the real reason with a misleading
+// one. The failure has to leave the code behind.
+func TestCallbackFailureRedirectsToLogin(t *testing.T) {
+	quietLogs(t)
+
+	for _, c := range []struct {
+		name  string
+		query string
+		state string
+	}{
+		{"no state cookie", "?code=abc&state=xyz", ""},
+		{"state did not match", "?code=abc&state=wrong", "xyz"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			auth := newTestAuth(t)
+
+			r := httptest.NewRequest(http.MethodGet, "/auth/callback"+c.query, nil)
+			if c.state != "" {
+				r.AddCookie(&http.Cookie{Name: "state", Value: c.state})
+				r.AddCookie(&http.Cookie{Name: "nonce", Value: "n"})
+			}
+
+			w := httptest.NewRecorder()
+
+			_, err := auth.authCallback(context.Background(), w, r)
+			if !errors.Is(err, ErrSkipRender) {
+				t.Fatalf("got error %v, want ErrSkipRender", err)
+			}
+
+			if w.Code != http.StatusFound {
+				t.Fatalf("got status %d, want a redirect", w.Code)
+			}
+
+			loc := w.Header().Get("Location")
+
+			if !strings.HasPrefix(loc, "/auth/login?") {
+				t.Errorf("redirect = %q, want the login page", loc)
+			}
+
+			// The code must not survive into the URL the visitor lands on,
+			// or reloading that page re-submits it.
+			if strings.Contains(loc, "code=") {
+				t.Errorf("redirect %q still carries the authorization code", loc)
+			}
+
+			if !strings.Contains(loc, loginFailedParam+"=1") {
+				t.Errorf("redirect %q does not mark the login as failed", loc)
+			}
+		})
+	}
+}
+
+// TestLoginPageReportsAFailedAttempt checks that the flag reaches the
+// template, so an application can say something rather than silently
+// re-showing the login button.
+func TestLoginPageReportsAFailedAttempt(t *testing.T) {
+	auth := newTestAuth(t)
+
+	plain, err := auth.authLogin(context.Background(), httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodGet, "/auth/login", nil))
+	if err != nil {
+		t.Fatalf("login page: %v", err)
+	}
+
+	if c, ok := plain.Contents.(LoginPage); !ok || c.Failed {
+		t.Errorf("a plain login page reports Failed=%v, want false", c.Failed)
+	}
+
+	failed, err := auth.authLogin(context.Background(), httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodGet,
+			"/auth/login?"+loginFailedParam+"=1", nil))
+	if err != nil {
+		t.Fatalf("login page after a failure: %v", err)
+	}
+
+	if c, ok := failed.Contents.(LoginPage); !ok || !c.Failed {
+		t.Errorf("login page after a failure reports Failed=%v, want true",
+			c.Failed)
+	}
+}

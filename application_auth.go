@@ -508,12 +508,54 @@ func assumeTokenExpiry(ctx context.Context, token *oauth2.Token) {
 	token.Expiry = time.Now().Add(assumedAccessTokenLifetime)
 }
 
+// loginFailedParam marks the login page as following a failed attempt. It
+// is a query parameter, so anyone can set it and see the notice; all that
+// buys them is a notice, and it keeps the reason for the failure server-side
+// where it belongs.
+const loginFailedParam = "login_failed"
+
+// LoginPage is the Contents of the login page. A template can show the
+// notice with {{if .Contents.Failed}}; one that ignores it renders exactly
+// as before.
+type LoginPage struct {
+	// Failed reports that the visitor arrived here because a login attempt
+	// did not complete. Why it did not is in the log rather than here:
+	// there is nothing a visitor can do with the detail but try again, and
+	// some of it should not be shown to them at all.
+	Failed bool
+}
+
+// failLogin logs why a login attempt ended and sends the visitor back to the
+// login page to start another one.
+//
+// The reason is deliberately not rendered at the callback URL. That URL still
+// carries the authorization code in its query string, so an error page there
+// is one that a reload re-submits — and a provider's answer to a code it has
+// already redeemed is "code not valid", which replaces the real reason with a
+// misleading one and makes a recoverable failure look permanent. Redirecting
+// takes the code out of the address bar, so trying again actually tries
+// again.
+func (a *OIDCAuth) failLogin(
+	w http.ResponseWriter, r *http.Request, err error,
+) (*Page, error) {
+	slog.WarnContext(r.Context(), "login attempt failed", "err", err)
+
+	http.Redirect(w, r,
+		a.basePath.Path("/auth/login")+"?"+loginFailedParam+"=1",
+		http.StatusFound)
+
+	return nil, ErrSkipRender
+}
+
 func (a *OIDCAuth) authLogin(
-	_ context.Context, _ http.ResponseWriter, _ *http.Request,
+	_ context.Context, _ http.ResponseWriter, r *http.Request,
 ) (*Page, error) {
 	return &Page{
 		Template: "login.html",
 		Title:    TL("LogIn", "Log In"),
+		Contents: LoginPage{
+			Failed: r.URL.Query().Get(loginFailedParam) != "",
+		},
 	}, nil
 }
 
@@ -578,9 +620,6 @@ func (a *OIDCAuth) authLogout(
 func (a *OIDCAuth) authCallback(
 	ctx context.Context, w http.ResponseWriter, r *http.Request,
 ) (*Page, error) {
-	failMsg := TL("FailedToHandleLogin",
-		"Failed to handle login, please try again")
-
 	if oidcErr := r.URL.Query().Get("error"); oidcErr != "" {
 		desc := r.URL.Query().Get("error_description")
 		if desc == "" {
@@ -593,14 +632,12 @@ func (a *OIDCAuth) authCallback(
 
 	state, err := r.Cookie("state")
 	if err != nil {
-		return nil, HTTPErrorf(http.StatusBadRequest, failMsg,
-			"state not found")
+		return a.failLogin(w, r, errors.New("no state cookie"))
 	}
 
 	nonce, err := r.Cookie("nonce")
 	if err != nil {
-		return nil, HTTPErrorf(http.StatusBadRequest, failMsg,
-			"nonce not found")
+		return a.failLogin(w, r, errors.New("no nonce cookie"))
 	}
 
 	// The bool is not needed: a request that carries no redirect cookie, or
@@ -627,39 +664,37 @@ func (a *OIDCAuth) authCallback(
 	a.clearCallbackCookie(w, authRedirCookieName)
 
 	if r.URL.Query().Get("state") != state.Value {
-		return nil, HTTPErrorf(http.StatusBadRequest, failMsg,
-			"state did not match")
+		return a.failLogin(w, r, errors.New("state did not match"))
 	}
 
 	oauth2Token, err := a.conf.Exchange(
 		ctx, r.URL.Query().Get("code"))
 	if err != nil {
-		return nil, HTTPErrorf(http.StatusInternalServerError, failMsg,
-			"failed to exchange token: %w", err)
+		return a.failLogin(w, r,
+			fmt.Errorf("exchange the authorization code: %w", err))
 	}
 
 	rawIDToken, ok := oauth2Token.Extra("id_token").(string)
 	if !ok {
-		return nil, HTTPErrorf(http.StatusInternalServerError, failMsg,
-			"no id_token field in oauth2 token: %w", err)
+		return a.failLogin(w, r,
+			errors.New("the token response carries no id_token"))
 	}
 
 	idToken, err := a.verifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		return nil, HTTPErrorf(http.StatusInternalServerError, failMsg,
-			"failed to verify ID Token: %w", err)
+		return a.failLogin(w, r,
+			fmt.Errorf("verify the ID token: %w", err))
 	}
 
 	if idToken.Nonce != nonce.Value {
-		return nil, HTTPErrorf(http.StatusBadRequest, failMsg,
-			"nonce did not match")
+		return a.failLogin(w, r, errors.New("nonce did not match"))
 	}
 
 	if a.onLogin != nil {
 		err = a.onLogin(ctx, idToken)
 		if err != nil {
-			return nil, HTTPErrorf(http.StatusInternalServerError, failMsg,
-				"login callback: %w", err)
+			return a.failLogin(w, r,
+				fmt.Errorf("the login callback refused the login: %w", err))
 		}
 	}
 
@@ -672,8 +707,8 @@ func (a *OIDCAuth) authCallback(
 	// login and from nothing else.
 	err = a.setTokenCookie(w, oauth2Token, time.Now())
 	if err != nil {
-		return nil, HTTPErrorf(http.StatusInternalServerError, failMsg,
-			"set token cookie: %w", err)
+		return a.failLogin(w, r,
+			fmt.Errorf("set the session cookie: %w", err))
 	}
 
 	http.Redirect(w, r, resolveRedirect(a.basePath, target),
