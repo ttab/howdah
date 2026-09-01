@@ -114,14 +114,18 @@ var errNoCookieKeyring = errors.New("the cookie keyring is not initialised")
 // the cookie name is checked for the colon that would let two labels
 // collide.
 //
-// This pair is deliberately unexported for now, even though the keyring
-// itself is a type applications construct. An exported Seal whose domain
-// argument can only be built correctly by unexported code is an invitation
-// to hand-write the string, and a hand-written "cookie:token" is the
-// privilege escalation the domain exists to close. The release that adds
-// token stores needs both halves outside the package — a store seals its own
-// payloads — and that is when they are exported together, along with the
-// store purpose and the kind the stores use.
+// This pair is deliberately unexported, even though the keyring itself is a
+// type applications construct. An exported Seal whose domain argument can
+// only be built correctly by unexported code is an invitation to hand-write
+// the string, and a hand-written "cookie:token" is the privilege escalation
+// the domain exists to close.
+//
+// Sealing is a store's job — see TokenStore, which settles that — and
+// CookieTokenStore is in this package, so it uses these directly. A store in
+// a subpackage cannot, and SessionSealer is what it gets instead: both
+// halves together, with the store purpose, the handle kind and the domain
+// builder behind a constructor, so that the only way to name a domain from
+// outside is still to ask for one.
 func (k *CookieKeyring) seal(domain string, plaintext []byte) (string, error) {
 	return k.sealKind(sessionKindPayload, domain, plaintext)
 }
@@ -141,9 +145,27 @@ func (k *CookieKeyring) open(
 func (k *CookieKeyring) sealKind(
 	kind sessionKind, domain string, plaintext []byte,
 ) (string, error) {
+	sealed, _, err := k.sealKindRaw(kind, domain, plaintext)
+	if err != nil {
+		return "", err
+	}
+
+	return base64.RawURLEncoding.EncodeToString(sealed), nil
+}
+
+// sealKindRaw is the envelope writer. It hands back the binary envelope and
+// the id of the key it sealed under: a value that goes in a cookie is
+// base64url-encoded on top of it, and one that goes in a bytea column is
+// not, but a store that keeps the key id in a column of its own needs to
+// know which key that was without opening what it just wrote.
+func (k *CookieKeyring) sealKindRaw(
+	kind sessionKind, domain string, plaintext []byte,
+) ([]byte, [cookieKeyIDLength]byte, error) {
+	var noKID [cookieKeyIDLength]byte
+
 	key := k.sealingKey()
 	if key == nil {
-		return "", errNoCookieKeyring
+		return nil, noKID, errNoCookieKeyring
 	}
 
 	buf := make([]byte, cookieEnvelopeHeaderLength,
@@ -157,26 +179,43 @@ func (k *CookieKeyring) sealKind(
 
 	_, err := rand.Read(nonce)
 	if err != nil {
-		return "", fmt.Errorf("generate nonce: %w", err)
+		return nil, noKID, fmt.Errorf("generate nonce: %w", err)
 	}
 
 	sealed := key.aead.Seal(buf, nonce, plaintext,
 		cookieEnvelopeAAD(cookieEnvelopeV1, kind, key.kid, domain))
 
-	return base64.RawURLEncoding.EncodeToString(sealed), nil
+	return sealed, key.kid, nil
 }
 
 func (k *CookieKeyring) openKind(
 	kind sessionKind, domain, value string,
 ) ([]byte, bool, error) {
-	sealWith := k.sealingKey()
-	if sealWith == nil {
-		return nil, false, errNoCookieKeyring
-	}
-
 	raw, err := base64.RawURLEncoding.DecodeString(value)
 	if err != nil {
 		return nil, false, ErrNotSealed
+	}
+
+	plaintext, _, current, err := k.openKindRaw(kind, domain, raw)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return plaintext, current, nil
+}
+
+// openKindRaw is the envelope reader, and reports the id of the key the
+// envelope was sealed under alongside whether that is still the key we would
+// seal with. A store that sweeps its own storage under a retiring key needs
+// the id even where the value opened cleanly.
+func (k *CookieKeyring) openKindRaw(
+	kind sessionKind, domain string, raw []byte,
+) ([]byte, [cookieKeyIDLength]byte, bool, error) {
+	var kid [cookieKeyIDLength]byte
+
+	sealWith := k.sealingKey()
+	if sealWith == nil {
+		return nil, kid, false, errNoCookieKeyring
 	}
 
 	// Check the shape before dispatching on the version, or every legacy
@@ -187,28 +226,26 @@ func (k *CookieKeyring) openKind(
 	if len(raw) < cookieEnvelopeHeaderLength+cookieTagLength ||
 		raw[0] == 0 || raw[0] > cookieEnvelopeMaxVersion ||
 		!sessionKind(raw[1]).valid() {
-		return nil, false, ErrNotSealed
+		return nil, kid, false, ErrNotSealed
 	}
 
 	if raw[0] != cookieEnvelopeV1 {
-		return nil, false, fmt.Errorf("version %d: %w",
+		return nil, kid, false, fmt.Errorf("version %d: %w",
 			raw[0], ErrUnknownVersion)
 	}
 
 	// The kind is checked before the keyring is consulted, so a value
 	// from the other mode is rejected without holding its key.
 	if got := sessionKind(raw[1]); got != kind {
-		return nil, false, fmt.Errorf("expected %s, got %s: %w",
+		return nil, kid, false, fmt.Errorf("expected %s, got %s: %w",
 			kind, got, ErrWrongSessionKind)
 	}
-
-	var kid [cookieKeyIDLength]byte
 
 	copy(kid[:], raw[2:])
 
 	key, ok := k.keys[kid]
 	if !ok {
-		return nil, false, fmt.Errorf("key %x: %w", kid, ErrUnknownKey)
+		return nil, kid, false, fmt.Errorf("key %x: %w", kid, ErrUnknownKey)
 	}
 
 	nonce := raw[2+cookieKeyIDLength : cookieEnvelopeHeaderLength]
@@ -216,10 +253,10 @@ func (k *CookieKeyring) openKind(
 	plaintext, err := key.aead.Open(nil, nonce, raw[cookieEnvelopeHeaderLength:],
 		cookieEnvelopeAAD(raw[0], kind, kid, domain))
 	if err != nil {
-		return nil, false, fmt.Errorf("key %x: %w", kid, ErrAuthentication)
+		return nil, kid, false, fmt.Errorf("key %x: %w", kid, ErrAuthentication)
 	}
 
-	return plaintext, kid == sealWith.kid, nil
+	return plaintext, kid, kid == sealWith.kid, nil
 }
 
 // cookieEnvelopeAAD builds the additional authenticated data an envelope is
@@ -253,6 +290,10 @@ const (
 	cookieDomainSession cookieDomainPurpose = "cookie:"
 	// cookieDomainAuthRedirect labels the post-login redirect target.
 	cookieDomainAuthRedirect cookieDomainPurpose = "cookie:auth_redir:"
+	// cookieDomainStore labels a session payload a store keeps in its own
+	// storage rather than in the cookie, so that a payload sealed for a
+	// database row cannot be replayed as a cookie.
+	cookieDomainStore cookieDomainPurpose = "store:"
 )
 
 // cookieDomain builds the domain string a value is sealed under: a purpose

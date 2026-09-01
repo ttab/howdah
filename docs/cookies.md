@@ -8,7 +8,7 @@ rolled over, and every way a session ends.
 | Document | What it settles |
 |---|---|
 | [README](../README.md) | Orientation and the working reference: what the package holds, how to wire an application up, and every option it takes. |
-| [architecture.md](architecture.md) | How howdah is built: the component model, the page pipeline, and the OIDC flow. |
+| [architecture.md](architecture.md) | How howdah is built: the component model, the page pipeline, the OIDC flow, and where a session lives. |
 | **cookies.md** (this document) | The cookie and session contract. |
 
 It does not cover how to wire `OIDCAuth` up — that is the README — or the
@@ -27,6 +27,23 @@ All three belong to a single login attempt. The callback clears them as it
 reads them, and a login started without a redirect target clears any target
 an abandoned attempt left behind — otherwise a login from the login page
 lands the user wherever they were headed an hour ago.
+
+**What is inside the session cookie is the store's to decide, and howdah does
+not look.** The store howdah builds for itself seals the whole session into
+the cookie — the token set, the OIDC `sub`, and the `issued_at` the maximum
+session age is counted against — while a store that keeps sessions of its own
+seals nothing but a handle to one, some ninety bytes of it. Either way the
+value is opaque to everything but the store that produced it, and the envelope
+says which of the two it is holding in a byte outside the ciphertext, so a
+value left over from the other mode is a clean "this application changed
+store" signal rather than a tampering alarm (§3). Which store an application
+has is [Where sessions live](../README.md#where-sessions-live); what the two
+cost in bytes is §4.
+
+The raw `id_token` is in neither. A store may keep one — `tokenstore/pgstore`
+does, against the `id_token_hint` that RP-initiated logout will need — but the
+cookie-backed store drops it, because another JWT of the access token's order
+does not fit in what the cookie has left.
 
 A sealed value is bound to the cookie it lives in, not merely to the kind of
 value it is, so two applications sharing a host and a keyring cannot open
@@ -97,11 +114,14 @@ the secret, which is why reusing a variable name for a new secret is safe —
 identity comes from the key, not from where it was written down.
 
 `kind` says whether the ciphertext holds a whole session payload or a handle
-to one stored elsewhere. Nothing writes handles yet; the byte exists now
-because retrofitting it later would mean a release where the two shapes are
-indistinguishable, and the mismatch would surface as
-`ErrAuthentication` — tampering — rather than as the benign
-`ErrWrongSessionKind`.
+to one stored elsewhere, and both are written: the store howdah builds for
+itself seals payloads, `tokenstore/pgstore` seals handles. The byte sits
+outside the ciphertext so that a reader can reject the other mode's value
+without holding the right key at all, and it is covered by the AAD so it
+cannot be edited. It was in the format a release before the first handle was
+written, and that is what makes moving an application between the two modes
+one benign `ErrWrongSessionKind` and one re-login, rather than an
+`ErrAuthentication` that reads as tampering.
 
 **The additional authenticated data carries the cookie name, not just the kind
 of value.** AES-GCM authenticates the AAD without encrypting it, so opening
@@ -124,7 +144,8 @@ collide.
 ## 4. What fits in a cookie
 
 A browser guarantees 4096 bytes per cookie, counting the name, the value and
-the attributes, and the store-less session carries the user's whole token set.
+the attributes, and a session sealed into the cookie carries the user's whole
+token set.
 **A browser drops an oversized cookie silently** — nothing comes back to the
 server and nothing appears in the response — so the failure used to present as
 a login that reported success and landed the user back on the login page, with
@@ -133,11 +154,18 @@ the limit, so the login fails once and says why.
 
 Measured, rather than estimated: imagereporting's sealed session cookie
 against the tt realm on stage is **2453 bytes**, leaving about 1550 to spare.
+What is in there is the token set, the subject and the `issued_at`; the raw
+`id_token` is left out deliberately, since another JWT of the access token's
+order would spend that whole margin on something no store-less session can
+act on.
+
 The design document that preceded this work extrapolated 3527 from a guessed
 token size and concluded the cookie was nearly full; it was not. The ceiling
 is real all the same — a realm with a much fatter `roles` or `groups` claim
-would close that gap — and a later release that keeps sessions server-side
-would remove the question by putting a handle in the cookie instead.
+would close that gap — and the way out of the question entirely is to keep the
+session server-side: `tokenstore/pgstore` puts a sealed handle of about ninety
+bytes in the cookie and the tokens in a row, so the token set stops being part
+of the cookie's budget.
 
 ## 5. The keyring environment format
 
@@ -234,11 +262,22 @@ different things, and only one is worth alerting on.
 | `howdah.ErrNotSealed` | Does not parse as an envelope at all | Info | Rolling out the release that starts sealing, while browsers still hold plaintext cookies |
 | `howdah.ErrUnknownVersion` | An envelope from a newer howdah | Info | Rolling back |
 | `howdah.ErrUnknownKey` | The key id is not in the keyring | Info | After dropping a retired key |
-| `howdah.ErrWrongSessionKind` | The envelope holds a payload where a handle was expected, or the reverse | Info | Reserved for a later release: nothing writes handles yet |
+| `howdah.ErrWrongSessionKind` | The envelope holds a payload where a handle was expected, or the reverse | Info | After moving an application between the cookie-backed store and one that keeps sessions of its own: every browser is holding the other mode's value |
 | `howdah.ErrAuthentication` | The key was known, but decryption failed | **Warn** | Rare. Tampering, two environments crossed, or a cookie an intermediary truncated |
 
 A session whose sealed `issued_at` is older than the maximum session age is
-cleared the same way, as is one whose payload does not parse.
+cleared the same way, as is one whose payload does not parse, and so is one
+the store does not know or has expired — every one of those wraps
+`howdah.ErrNoSession`.
+
+**A store that could not answer is not one of these, and its cookie is left
+alone.** A cookie that cannot be opened is a session that is over; storage
+that cannot be read is a session howdah could not find out about, and in
+store mode the cookie is the only handle to a row that is still there.
+Clearing it over a database failover would log out every user whose request
+landed inside it, so those requests answer 503 — logged at error level, since
+a store that cannot be read is a fault rather than rollout noise — and the
+next request succeeds against the session that never went anywhere.
 
 Plaintext cookies from before sealing are **not** migrated. They come back
 as `ErrNotSealed`, get unset, and the user logs in again — which is a
@@ -253,11 +292,21 @@ A session ends, and the user logs in again, when any of these is true:
 |---|---|
 | The cookie cannot be opened | The taxonomy in §8 |
 | The sealed `issued_at` is older than the maximum session age | `unusable session cookie` with the age and the cap |
-| The refresh token is rejected by the provider | `refresh the access token` at error level |
-| The user logs out | Nothing; the cookie is cleared |
+| The refresh token is rejected by the provider | `resolve the session` at error level, wrapping `howdah.ErrRefreshRejected` |
+| The user logs out | Nothing; the store is asked to forget the session and the cookie is cleared |
+| The store no longer has the session — a logout in another browser, a `DeleteSubject`, a `DeleteExpired` sweep, or a `DELETE` an operator ran | `unusable session cookie` wrapping `howdah.ErrNoSession`: the browser is holding a handle that resolves to nothing |
 
-**The maximum session age is counted against an `issued_at` sealed into the
-cookie, not against the cookie's `Expires`,** which is only ever a request to
+A session is held by a `howdah.TokenStore`, and the default one seals it into
+the cookie and keeps nothing — which is why logging out clears one browser and
+revokes nothing, and why a copied cookie value keeps working until the session
+reaches its maximum age. A store that keeps sessions somewhere makes logout a
+revocation, gives an operator a way to end one session or every session of
+one subject, and makes everything below its answer rather than the cookie's.
+See [Where sessions live](../README.md#where-sessions-live).
+
+**The maximum session age is counted against an `issued_at` the store keeps —
+for the default store, sealed into the cookie — not against the cookie's
+`Expires`,** which is only ever a request to
 the browser and means nothing to somebody holding a copied value. Refreshing
 the access token does not extend it, and the `issued_at` is carried forward
 unchanged across every re-seal — restarting it would slide the cap forward
@@ -274,10 +323,14 @@ except on the pages they wanted.
 `OIDCAuth.Keepalive` is an `http.HandlerFunc` for a periodic XHR from the
 frontend, so a session does not lapse while somebody reads a long page that
 never calls `RequireAuth`. It refreshes the access token when it is near
-expiry, answers 204 on success and 401 when there is no usable session, and
-clears the cookie when a refresh fails so the browser stops sending one that
-can no longer be renewed. Register it on the mux the application uses for its
-API endpoints rather than on the `PageMux`:
+expiry and answers 204 on success. A session that is over gets 401 and a
+cleared cookie, so the browser stops sending one that can no longer be
+renewed; a session it could not resolve — the store would not answer, or the
+wait for another caller's refresh ran out — gets **503 and keeps its cookie**,
+because the next tick will very likely find the session exactly where it was.
+A frontend that treats 401 as "log in again" and 503 as "try again shortly"
+is reading it the way it is meant. Register it on the mux the application uses
+for its API endpoints rather than on the `PageMux`:
 
 ```go
 mux.HandleFunc("GET /auth/keepalive", auth.Keepalive)
@@ -292,11 +345,19 @@ With refresh token rotation enabled at the provider they otherwise would: the
 first exchange invalidates the token and the rest come back `invalid_grant`,
 bouncing the user to login intermittently and under load.
 
-**The deduplication is per process and does not reach across replicas.** The
-tokens live in the cookie, so there is nothing for two replicas to coordinate
-through. Two replicas serving the same session inside the refresh margin can
-still both refresh, which is the remaining exposure if rotation is turned on
-fleet-wide.
+**With the default store the deduplication is per process and does not reach
+across replicas.** The tokens live in the cookie, so there is nothing for two
+replicas to coordinate through. Two replicas serving the same session inside
+the refresh margin can still both refresh, which is the remaining exposure if
+rotation is turned on fleet-wide. How far the deduplication reaches is the
+store's to decide and to document, and callers cannot assume the exchange runs
+exactly once.
+
+`tokenstore/pgstore` closes that gap: the row carries a refresh lease, so the
+exchange happens once per session however many replicas want one. Turning
+refresh token rotation on fleet-wide is therefore a decision to move every
+application onto a stored session — see
+[the store's own notes](../README.md#keeping-sessions-in-postgres).
 
 Two fields RFC 6749 leaves optional are decided where a token enters the
 session rather than in the request path. A refresh response without a
@@ -352,16 +413,29 @@ of it should not be shown to them.
    under key 2 on the next request that touches its session. Nobody is
    logged out. `selected cookie sealing key` in a restarted replica's log,
    or `SealingKey()`, confirms which key is in use.
-3. **Wait out the maximum session age** (`howdah.DefaultMaxSessionAge`,
-   or whatever `WithMaxSessionAge` was given). Re-sealing only happens on a
-   request, so an idle session keeps its key 1 cookie until its user comes
-   back or it ages out; there is no way to sweep outstanding cookies. A
-   later release that keeps sessions server-side will replace this wait with
-   a re-key pass.
+3. **Drain what key 1 still holds open.** Two halves are sealed, and they
+   move at different times. The value in the browser is re-sealed by the
+   request that carries it, so an idle session keeps its key 1 cookie until
+   its user comes back — there is no way to sweep outstanding cookies, in
+   either mode, so this half ends by waiting out the maximum session age
+   (`howdah.DefaultMaxSessionAge`, or whatever `WithMaxSessionAge` was
+   given). A stored session's row is re-sealed when a refresh writes it, and
+   one that never refreshes is one that expires and is swept by
+   `DeleteExpired`, so the wait is the same with a store as without.
+
+   **There is deliberately no sweep that re-seals rows ahead of that.** It
+   would not shorten this wait — nothing reaches a cookie in a browser that
+   sends no requests — and a sweep racing a refresh is how a token the
+   provider has revoked gets written back over a live one. If you want to
+   know whether the wait is over rather than assume it, count the live rows
+   still on the old key: `key_id` is indexed for exactly that question.
 4. **Drop the old key.** Remove `COOKIE_KEY_1` and deploy. Renumber the rest
    if you like — the numbers carry no meaning. Any straggler still holding a
    value sealed under key 1 comes back as `ErrUnknownKey`, has its cookie
-   unset, and lands on the login page.
+   unset, and lands on the login page. Doing it before step 3 has finished is
+   a choice, not an error: what it costs is a login from everybody who has not
+   made a request since step 2, which is why the sweep is worth doing first
+   even though it cannot make the wait shorter.
 
 **Emergency revocation is step 4 done immediately.** Delete the compromised
 key and deploy, and everyone holding a value sealed under it is logged out.

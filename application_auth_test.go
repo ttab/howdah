@@ -135,6 +135,35 @@ func testToken(expiry time.Time) *oauth2.Token {
 	}
 }
 
+// storeTestSession returns the session the cookie-backed store makes of
+// these tokens and this issued_at.
+//
+// It goes through the concrete store rather than TokenStore.Create because
+// the issued_at is the store's to set — a session is created now, by
+// definition — while the tests need sessions that started hours ago, since
+// that is what the absolute session expiry is measured against.
+func storeTestSession(
+	t *testing.T, auth *OIDCAuth, token *oauth2.Token, issuedAt time.Time,
+) *StoredToken {
+	t.Helper()
+
+	store, ok := auth.store.(*CookieTokenStore)
+	if !ok {
+		t.Fatalf("the auth holds a %T, not a cookie-backed store",
+			auth.store)
+	}
+
+	session, err := store.seal(&StoredToken{
+		Token:    token,
+		IssuedAt: issuedAt,
+	})
+	if err != nil {
+		t.Fatalf("seal session cookie: %v", err)
+	}
+
+	return session
+}
+
 // sealTestSession returns the session cookie value auth would write for a
 // session with these tokens and this issued_at.
 func sealTestSession(
@@ -142,19 +171,7 @@ func sealTestSession(
 ) string {
 	t.Helper()
 
-	w := httptest.NewRecorder()
-
-	err := auth.setTokenCookie(w, token, issuedAt)
-	if err != nil {
-		t.Fatalf("seal session cookie: %v", err)
-	}
-
-	cookies := setCookies(w, auth.cookieName)
-	if len(cookies) != 1 {
-		t.Fatalf("got %d session cookies, want 1", len(cookies))
-	}
-
-	return cookies[0].Value
+	return storeTestSession(t, auth, token, issuedAt).Handle
 }
 
 // openTestSession opens a sealed session cookie value the way
@@ -285,12 +302,12 @@ func TestSessionCookieIsSealed(t *testing.T) {
 		t.Fatalf("read the session cookie back: %v", err)
 	}
 
-	if session.token.RefreshToken != "the-refresh-token" {
+	if session.Token.RefreshToken != "the-refresh-token" {
 		t.Errorf("refresh token = %q, want %q",
-			session.token.RefreshToken, "the-refresh-token")
+			session.Token.RefreshToken, "the-refresh-token")
 	}
 
-	if session.stale {
+	if session.Stale {
 		t.Error("a freshly sealed cookie was reported as stale")
 	}
 
@@ -809,9 +826,9 @@ func TestRefreshDeduplication(t *testing.T) {
 				return
 			}
 
-			token, ok := auth.checkTokenExpiry(w, r, session)
-			if !ok {
-				t.Errorf("goroutine %d: refresh failed", i)
+			token, err := auth.checkTokenExpiry(w, r, session)
+			if err != nil {
+				t.Errorf("goroutine %d: refresh failed: %v", i, err)
 
 				return
 			}
@@ -1271,5 +1288,78 @@ func TestLoginPageReportsAFailedAttempt(t *testing.T) {
 	if c, ok := failed.Contents.(LoginPage); !ok || !c.Failed {
 		t.Errorf("login page after a failure reports Failed=%v, want true",
 			c.Failed)
+	}
+}
+
+// TestRefreshExchangeHonoursTheCallersDeadline pins both halves of the
+// detachment, which pull in opposite directions and were not both there.
+//
+// The exchange must not be cancelled with the request: the provider has
+// already acted, and with several requests collapsed onto one exchange the
+// client that goes away is not necessarily the one that started it. But
+// context.WithoutCancel returns a context with no deadline at all, so
+// detaching by itself throws away the budget the caller set — and a store
+// that bounds the exchange before handing it down, which is what
+// pgstore.WithTokenRequestTimeout does, sizes its refresh lease against that
+// budget. A round trip that outlives the lease lets a second caller post the
+// same refresh token, which is the double exchange the lease exists to
+// prevent.
+func TestRefreshExchangeHonoursTheCallersDeadline(t *testing.T) {
+	var slow atomic.Bool
+
+	slow.Store(true)
+
+	provider := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		if slow.Load() {
+			// A provider slower than the deadline below. It
+			// answers in the end rather than hanging, so that
+			// nothing about this test rests on the server
+			// noticing that the client went away.
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(400 * time.Millisecond):
+			}
+		}
+
+		tokenResponse(t, 300)(w, r)
+	})
+
+	auth := newTestAuthWith(t, provider, newTestAuthKeyring(t))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	begin := time.Now()
+
+	_, err := auth.exchangeToken(ctx, testToken(time.Now()))
+	if err == nil {
+		t.Fatal("the exchange outlived the deadline it was given and succeeded")
+	}
+
+	if waited := time.Since(begin); waited > time.Second {
+		t.Errorf("the exchange took %s, want it stopped at the caller's deadline",
+			waited.Round(10*time.Millisecond))
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("got error %v, want the caller's deadline", err)
+	}
+
+	// And the refusal to be cancelled is intact: a client that has already
+	// gone away must not take the rotated token with it.
+	slow.Store(false)
+
+	gone, disconnect := context.WithCancel(t.Context())
+	disconnect()
+
+	token, err := auth.exchangeToken(gone, testToken(time.Now()))
+	if err != nil {
+		t.Fatalf("exchange for a client that has gone away: %v", err)
+	}
+
+	if token.AccessToken != "new-access" {
+		t.Errorf("got the access token %q, want %q",
+			token.AccessToken, "new-access")
 	}
 }

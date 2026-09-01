@@ -7,7 +7,7 @@ the request flows.
 | Document | What it settles |
 |---|---|
 | [README](../README.md) | Orientation and the working reference: what the package holds, how to wire an application up, and every option it takes. |
-| **architecture.md** (this document) | The internals: the render pipeline, the hook system, and the OIDC flow. |
+| **architecture.md** (this document) | The internals: the render pipeline, the hook system, the OIDC flow, and where a session lives. |
 | [cookies.md](cookies.md) | The cookie and session contract: sealing, the keyring, rotation, and every way a session ends. |
 
 It does not cover the cookie format or key rotation — those are
@@ -139,7 +139,7 @@ prefix-mounted application used to send the visitor to the server root.
     ├─ verify the ID token              │ any failure from here on:
     ├─ compare the nonce                │ log at warn, 302 to the login
     ├─ WithOnLogin callback, if any     │ page with ?login_failed=1
-    ├─ seal the session, set the cookie ─┘ (never an error page — see
+    ├─ store.Create then set the cookie ─┘ (never an error page — see
     └─ 302 → the redirect target             cookies.md §10)
 ```
 
@@ -157,8 +157,11 @@ makes the comparison fail; sealing them would buy nothing. `auth_redir` is
 sealed because it is a value the application acts on. This is settled — see
 cookies.md §1.
 
-Refresh, the session age cap and `Keepalive` are
-[cookies.md §9](cookies.md#9-what-ends-a-session).
+The session itself is the store's, not the callback's: `store.Create` is
+handed the token set, the `sub` and the raw `id_token`, and hands back the
+handle that goes in the cookie — see [Where a session
+lives](#where-a-session-lives). Refresh, the session age cap and `Keepalive`
+are [cookies.md §9](cookies.md#9-what-ends-a-session).
 
 ## Mounting under a path prefix
 
@@ -180,18 +183,194 @@ is not optional in that arrangement, and it doubles as the sealing domain, so
 two applications can share a keyring without being able to open each other's
 sessions.
 
+## Where a session lives
+
+`OIDCAuth` does not hold sessions; a `TokenStore` does, and the default one is
+`CookieTokenStore`, which seals the whole session into the cookie and keeps
+nothing. The store owns sealing, which is the decision the interface is built
+around: if `OIDCAuth` sealed the handle itself it would have to choose the
+envelope's kind byte and know which kind to expect on the way back in, and
+that is the "which implementation have I got" switch the interface exists to
+remove.
+
+```
+  a request carrying a session cookie
+    │
+    ▼
+  readTokenCookie ── store.Get(cookie value) ──→ *StoredToken
+    │                    ├─ ErrNoSession ──→ clear the cookie, 302 to login
+    │                    └─ anything else ──→ keep the cookie, 503
+    ▼
+  checkTokenExpiry
+    ├─ access token has more than the refresh margin left
+    │    └─ Stale? ──→ store.Reseal ──→ one Set-Cookie
+    └─ otherwise
+         └─ store.Refresh(exchange) ──→ Stale? store.Reseal
+              ├─ handle changed? ──→ one Set-Cookie
+              ├─ ErrRefreshRejected ──→ clear the cookie, 302 to login
+              └─ anything else ──→ keep the cookie, 503
+```
+
+**Only a session that is over takes the cookie with it.** The two outcomes on
+the right of every failure are the same split, and it is `sessionGone` that
+makes it: a session unknown to the store, past its absolute expiry, sealed
+under a key that is gone, or one the provider has refused to refresh
+(`ErrNoSession`, `ErrRefreshRejected`) is over, so the cookie is cleared and
+the browser stops sending it. Everything else — the storage could not be read,
+the wait for another caller's refresh ran out, the write-back was fenced —
+means "I could not find out", and the session is very likely still there.
+
+That distinction did not exist before the tokens moved into a store, because
+a store-less session *is* the cookie: there was nothing else to lose, so
+clearing it on any failure cost nothing. A stored session is a row, and the
+cookie is the only handle anybody has to it. Clearing it over a two-second
+database failover logs out every user whose access token happened to be
+inside the refresh margin — and leaves their rows unreachable until
+`DeleteExpired` sweeps them at the maximum session age. Those requests fail
+with a 503 instead, and the next one succeeds against the row that never
+went anywhere. `TestSessionSurvivesAStoreThatCannotAnswer` holds the line.
+
+**The cookie is written when the handle changed *or* when the value came in
+under a key we no longer seal with,** and both halves are load-bearing. A
+store-less handle is the sealed session itself, so it changes on every write;
+a handle to a stored session survives a refresh, so "changed" alone would
+never fire and a key rollover would never reach a stored session at all.
+Every branch resolves to at most one `Set-Cookie`, which is what
+`TestSessionCookieReSealedUnderCurrentKey` and
+`TestStoredSessionStaleHandleIsResealed` hold the line on.
+
+The token endpoint round trip stays in `OIDCAuth` and is passed to
+`Refresh` as a function, on a context detached from the request: a client
+that disconnects mid-exchange would otherwise cancel a call the provider has
+already acted on, and with several requests collapsed onto one exchange the
+client that goes away is not necessarily the one that started it. Which
+requests share an exchange, and whether that reach is a process or the fleet,
+is the store's business.
+
+**Detached from the cancellation, not from the deadline.**
+`context.WithoutCancel` returns a context with no deadline at all, so
+detaching by itself throws away whatever budget the caller set — and a store
+that bounds the exchange before handing it down sizes its refresh lease
+against exactly that budget. `detachedDeadline` therefore keeps the sooner of
+the caller's deadline and howdah's own ten seconds, so the number the store
+validated against is the number that bounds the round trip. An exchange that
+outlives the lease is an exchange a second caller is free to repeat, which
+with refresh token rotation on is the failure the lease exists to prevent.
+
+### One refresh per session, fleet-wide
+
+`tokenstore/pgstore` is the store for an application with a database, and
+what it adds beyond revocation and a server-checked expiry is that a refresh
+happens once per session however many replicas want one. It does that with a
+**lease column** rather than a lock:
+
+```
+  every caller ── read the row
+    ├─ the token in it is still good ──→ use it, no provider call
+    └─ otherwise ── conditional UPDATE taking the lease
+         ├─ got the row  ──→ exchange (detached ctx) ──→ commit, fenced on the
+         │                                              lease nonce
+         │                    └─ no rows? the lease was lost: discard, re-read
+         └─ got nothing ──→ poll on a bounded backoff until refreshed_at moves
+                            (or refresh_failed_at does, and fail fast)
+```
+
+**Not `SELECT … FOR UPDATE`, and not `pg_advisory_xact_lock`.** Either would
+serialise correctly and need no lease tuning, and either holds a transaction —
+and therefore a pooled connection — open across an HTTP round trip to the
+identity provider. A hung provider then pins one connection per concurrent
+request and drains the pool, so the failure mode is the whole application
+rather than just its logins. The lease holds no transaction: take it, commit,
+do the round trip, commit the result.
+
+Seven details that are each a bug if left out, and each have a test:
+
+- **The write-back is fenced on a lease nonce.** A refresher whose exchange
+  finished but whose write stalled past its lease would otherwise land on top
+  of a fresher winner's tokens, leaving a rotated-away refresh token in the
+  row and the session dead everywhere.
+- **The failure write-back is fenced the same way, and its row count is
+  read.** Zero rows means this refresher no longer owns the refresh, and its
+  own exchange error then says nothing about the session — most often it *is*
+  `invalid_grant`, because the caller that took the lease over rotated the
+  token this attempt was posting. Reporting it would end a session that was
+  refreshed a millisecond earlier, so it goes the way a fenced-out success
+  goes: discarded, and the row re-read.
+- **The re-read after a lost write-back is exempt from the wait.** A write is
+  fenced out only because somebody else's landed, so the answer is committed
+  already and one read away rather than an unknown wait. Giving up on the
+  budget there would answer `ErrRefreshTimeout` — and cost the caller its
+  session — over a token sitting in the row.
+- **The exchange and the write-back run on a context detached from the
+  request.** The provider has already acted; a client that disconnects must
+  not take the rotated token with it.
+- **The lease covers the round trip *and* the write-back.** The refresher
+  holds it from `TakeRefreshLease` until `CommitRefresh` lands, so a lease
+  sized against the round trip alone expires while the winner is still
+  committing — and the duplicate exchange that authorises is the failure the
+  lease exists to prevent. `New` refuses a store where the lease does not
+  outlast the token request timeout and the write timeout together.
+- **A refresher that fails records that.** Without the `refresh_failed_at`
+  column the waiting callers poll a `refreshed_at` that never moves, burn
+  their whole backoff, and then each attempt an exchange of their own — so a
+  provider outage becomes *n* serialised attempts per session instead of one.
+
+`DeleteExpired` takes its batch `FOR UPDATE SKIP LOCKED` in a deterministic
+order, which is what makes the sweep on a ticker safe for two replicas at
+once: without it one sweeper's statement selects the rows the other is
+deleting, waits for its locks and finds them gone — reporting 0 with rows
+still in the table — and two deletes taking their rows in opposite orders
+deadlock. It does mean that 0 from one sweeper means "nothing here for me
+right now" rather than "the table is clean", which is only the same thing
+when a job lock leaves one sweeper.
+
+The row id is `sha256` of the handle rather than the handle, so a database
+dump yields no usable session, and the row id is in the sealed payload's AAD,
+so a writer with database access cannot transplant one session's payload into
+another's row.
+
+**A key rollover reaches a stored session in two halves, and only one of them
+is a sweep.** The handle in the cookie is re-sealed by the request that
+carries it — `Stale`, then `Reseal` — and the payload in the row is re-sealed
+when a refresh writes it, which is to say never for a session nobody is using.
+**There is deliberately no sweep for that second half.** A sweep could
+re-seal the rows, but it could not reach the cookies, so it would not shorten
+the wait before a retired key can be dropped — and a sweep racing a refresh
+is how a token the provider has revoked gets written back over a live one.
+The wait is the maximum session age with a store or without it: a session that
+never refreshes is one that expires, and `DeleteExpired` takes the row. [cookies.md §11](cookies.md#11-rolling-a-key-over) is
+the runbook that puts the two halves in order.
+
 ## Pending work
 
-- **No server-side session store.** Sessions live entirely in the cookie, so
-  logout clears one browser and revokes nothing, a copied cookie value works
-  until the session age cap, and refresh deduplication cannot reach across
-  replicas. A `TokenStore` interface with a Postgres implementation is the
-  planned answer, and it also turns key retirement from "wait out the maximum
-  session age" into a re-key sweep.
 - **Nothing talks to the provider on logout.** No RFC 7009 revocation and no
   RP-initiated logout, so a session howdah ends leaves a live refresh token at
-  the provider. The `id_token` needed for `id_token_hint` is not persisted
-  either: `json.Marshal` drops `oauth2.Token`'s `Extra` map.
-- **`ErrWrongSessionKind` is reserved.** Nothing writes handle-kind envelopes
-  yet; the byte and the error exist so the store can be added without a
-  release in which the two shapes are indistinguishable.
+  the provider. `NewSession` and `StoredToken` carry the raw `id_token` that
+  `id_token_hint` needs — `json.Marshal` drops `oauth2.Token`'s `Extra` map,
+  so a store that does not take it at creation cannot get it back — but the
+  cookie-backed store drops it, having nowhere to put another JWT. `pgstore`
+  keeps it, so this is a piece of work rather than a piece of work plus a
+  migration.
+
+  **Decided: it stays out of scope, as separate work.** What has to be said
+  plainly until it exists is that *revocation* here means howdah's session and
+  nothing more — ending a session strands a refresh token the provider still
+  honours, and an operator who believes otherwise will not go looking for it.
+- **`pgx` is in the module graph of every consumer.** `pgstore` is a package
+  in the main module rather than a nested one, so an application with no
+  database still resolves `github.com/jackc/pgx/v5` and
+  `github.com/jackc/tern/v2` in its `go.sum`. Nothing links unless it is
+  imported, and one module keeps a release one tag, so the trade was made
+  deliberately.
+
+  **Decided: one module.** The evidence is a consumer with no database:
+  imagereporting on this version resolves pgx in `go.sum` and links **zero**
+  pgx packages, by `go list -deps`, with no source change of its own. Graph
+  noise, no build or binary cost. A nested module is what to reach for if that
+  ever stops being true.
+- **A session that survives a lost write-back.** If a refresh's exchange
+  succeeds and the commit then fails, the rotated token exists only in that
+  process's memory, and a stored session's cookie is only a handle — so there
+  is no recovery path and the user logs in again. Inherent to rotation plus
+  external storage, but it should be a monitored event rather than a
+  surprise.

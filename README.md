@@ -19,7 +19,7 @@ go get github.com/ttab/howdah
 | Document | What it settles |
 |---|---|
 | **README** (this document) | Orientation and the working reference: what the package holds, how to wire an application up, and every option it takes. |
-| [docs/architecture.md](docs/architecture.md) | How howdah is built: the render pipeline, the hook system, and the OIDC flow. Read it before changing howdah itself. |
+| [docs/architecture.md](docs/architecture.md) | How howdah is built: the render pipeline, the hook system, the OIDC flow, and where a session lives. Read it before changing howdah itself. |
 | [docs/cookies.md](docs/cookies.md) | The cookie and session contract: sealing, the keyring, key rotation, and every way a session ends. |
 
 ## Quick start
@@ -205,10 +205,14 @@ howdah.TLiteral("Not translated")              // literal string, no lookup
 registers routes for login, callback, logout, and handles token refresh
 automatically.
 
-The keyring is not optional: the session cookie carries the user's access
-*and refresh* token, so howdah has no mode in which it writes them to the
-browser in the clear. That is why it is a positional argument rather than an
-option, and why the constructor returns an error.
+The keyring is not optional, whichever store the application runs. Without one
+the session cookie carries the user's access *and refresh* token, so howdah
+has no mode in which it writes those to the browser in the clear; with a store
+it carries a handle, and sealing that binds it to the cookie it lives in — so
+two applications sharing a host cannot open each other's sessions — and makes
+dropping a key a way to end the sessions sealed under it. Every store seals,
+so the keyring is a positional argument rather than an option, and the
+constructor returns an error.
 
 ```go
 keyring, err := howdah.CookieKeyringFromEnv(
@@ -228,9 +232,115 @@ format, how to generate a key, and how to roll one over.
 
 A session lives for `howdah.DefaultMaxSessionAge` (12 hours) and refreshing
 the access token does not extend it. Concurrent refreshes of one session
-collapse onto a single round trip to the provider, per process. What ends a
-session, what `Keepalive` is for, and how refresh behaves are
+collapse onto a single round trip to the provider — per process without a
+store, and fleet-wide with one that can coordinate. Both are the store's
+answer rather than howdah's: see [Where sessions live](#where-sessions-live).
+What ends a session, what `Keepalive` is for, and how refresh behaves are
 [docs/cookies.md §9](docs/cookies.md#9-what-ends-a-session).
+
+### Where sessions live
+
+A session is held by a `howdah.TokenStore`, and unless an application says
+otherwise that store is a `howdah.CookieTokenStore`: the whole session is
+sealed into the cookie and howdah keeps nothing. That is what howdah has
+always done, and it is the right answer for a small backoffice tool that
+should not need a database to have a login.
+
+It gives up what cannot be had without storing something, and the two rows
+worth deciding on are revocation and how far a refresh deduplicates:
+
+| | `CookieTokenStore` (the default) | [`tokenstore/pgstore`](#keeping-sessions-in-postgres) |
+|---|---|---|
+| Needs a database | No | Yes |
+| In the cookie | The whole session, 2453 B measured | A handle, some 90 B |
+| Revoked by logging out | No — one browser's cookie is cleared, and a copied value works until the session ages out | Yes — the row is gone |
+| Log one person out everywhere | No | `DeleteSubject` |
+| Absolute expiry | A sealed `issued_at` the process checks | An `expires_at` column the database checks |
+| Refresh deduplication | Per process | Fleet-wide |
+| Safe with refresh token rotation at the provider | No | Yes |
+| Retiring a cookie key | Wait out the maximum session age | Wait out the maximum session age |
+
+Per-process deduplication is harmless until the provider rotates refresh
+tokens, at which point two replicas serving one session inside the refresh
+margin is an intermittent mid-session logout — which makes turning rotation on
+fleet-wide a decision to move every application onto a store.
+
+`WithTokenStore` hands `OIDCAuth` a store of the application's own instead.
+The store owns the session: it seals the handle that goes in the cookie,
+enforces the absolute expiry, and decides how far a concurrent refresh
+deduplicates. `OIDCAuth` cannot tell which one it is holding — it writes the
+handle a store hands back, and writes a new cookie only when that handle
+changed or when the value came in under a retired key.
+
+The interface is `Create`, `Get`, `Update`, `Reseal`, `Delete`, `Refresh` and
+`DeleteExpired`. howdah starts no goroutines of its own, so an application
+that wants expired sessions swept calls `DeleteExpired` on a schedule of its
+own.
+
+### Keeping sessions in Postgres
+
+`howdah/tokenstore/pgstore` is the store for an application that has a
+database. The cookie then holds a sealed handle of about ninety bytes, the
+tokens live in a row sealed under the same keyring, and the row id is
+`sha256` of the handle — so a database dump yields nothing anybody can log in
+with, and a sealed payload cannot be moved from one session's row to
+another's.
+
+```go
+store, err := pgstore.New(pool, keyring, "token")
+if err != nil {
+    return fmt.Errorf("create the session store: %w", err)
+}
+
+auth, err := howdah.NewOIDCAuth(provider, verifier, oauth2Conf, keyring,
+    howdah.WithSessionCookieName("token"), // the same name the store took
+    howdah.WithTokenStore(store),
+)
+```
+
+What the row buys: logout is a revocation rather than a cleared cookie,
+`DeleteSubject` logs one person out of every browser at once, the absolute
+expiry is a column the server checks, and a refresh is **serialised across
+the fleet** — the several requests of a page load collapse onto one token
+endpoint round trip however many replicas they land on, which is what makes
+it safe to turn refresh token rotation on at the provider.
+
+| Option | Effect |
+|---|---|
+| `WithMaxSessionAge` | The absolute session lifetime. Defaults to `DefaultMaxSessionAge`. |
+| `WithRefreshLease` | How long a refresher holds the right to refresh: the token endpoint round trip *and* the write-back. `New` refuses a lease that does not outlast the token request timeout and the write timeout together, and it is what the next caller waits out if a refresher dies mid-exchange. |
+| `WithTokenRequestTimeout` | Bounds the token endpoint round trip, which runs detached from the request. |
+| `WithRefreshMargin` | How little life an access token may have left for a concurrent refresh's result to be used as-is. |
+| `WithRefreshWait` | How long a caller waits for another caller's refresh before failing with `ErrRefreshTimeout`. |
+| `WithWriteTimeout` | Bounds the writes that must happen even though the request is gone: recording a refresh, and recording that one failed. |
+
+**A service on tern should vendor the migration rather than apply it from
+here.** Both `mage sql:migrate` and elephant-platform's `setup db migrate`
+apply exactly the tern files in a service's own `./schema` and neither looks
+inside a dependency, so a migration applied only through this package never
+runs in a hosted deploy — the API serves normally and every login fails on a
+missing `howdah_session`. Declare howdah in `schema/vendor.json`, run
+`mage sql:vendor`, and commit what it writes; `mage sql:vendorCheck` fails when
+a later migration has not been taken. That needs `github.com/ttab/mage`
+v0.11.2 or later.
+
+`pgstore.Migrate(ctx, pool)` and `pgstore.MigrateConn` are still there, for an
+application that migrates some other way, and they track their version in
+`howdah_session_version` so howdah's numbering cannot collide with the
+application's own. `pgstore.Migrations` is the embedded `fs.FS` behind both.
+**Whichever route, the migrations are the application's to run and never the
+service's to run at startup** — a migration at startup turns every restart,
+scale-up and rollback into a schema change.
+
+One job the application schedules, because howdah starts no goroutines:
+`DeleteExpired(ctx, batch)` sweeps sessions past their expiry. Call it until
+it returns 0.
+
+There is deliberately no sweep that re-seals rows under a new cookie key,
+because it would not shorten the wait before a retired key can be dropped:
+nothing reaches a cookie in a browser that sends no requests, whichever store
+you run. A stored session's row is re-sealed when a refresh writes it, and one
+that never refreshes is one that expires and is swept.
 
 ### Options
 
@@ -238,7 +348,8 @@ session, what `Keepalive` is for, and how refresh behaves are
 |---|---|
 | `WithBasePath` | Resolve redirects and cookie paths against a mount prefix. See [Mounting under a path prefix](#mounting-under-a-path-prefix). |
 | `WithSessionCookieName` | Name the session cookie. Required when applications share a host, and it is also the sealing domain. |
-| `WithMaxSessionAge` | Change the maximum session age from `DefaultMaxSessionAge`. |
+| `WithMaxSessionAge` | Change the maximum session age from `DefaultMaxSessionAge`. Configures the store howdah builds for itself, so it cannot be combined with `WithTokenStore`. |
+| `WithTokenStore` | Keep sessions in a store of your own rather than in the cookie. See [Where sessions live](#where-sessions-live). |
 | `WithInsecureCookies` | Drop `Secure`. For a plain-http local run, and nothing else. |
 | `WithOnLogin` | A callback after a successful login, before the session cookie is set. Provision users here rather than on every request. |
 
@@ -285,9 +396,12 @@ func (c *MyComponent) handlePage(
 
 `RequireAuth` redirects unauthenticated users to the login page and
 refreshes expired tokens automatically. A session cookie it cannot use —
-unsealed, sealed under a key that is gone, tampered with, or past the
-maximum session age — is cleared on the way out, so the browser stops
-sending it. On success it adds an
+unsealed, sealed under a key that is gone, tampered with, past the
+maximum session age, or holding a refresh token the provider has refused — is
+cleared on the way out, so the browser stops sending it. A session it merely
+could not *resolve* is a different matter: a store that would not answer
+leaves the cookie alone and returns a 503, because the session is very likely
+still there and the cookie may be the only handle to it. On success it adds an
 `Authorization: Bearer` header to the context (for forwarding to backend
 services via Twirp) and stores the verified access token, retrievable with
 `howdah.AccessToken(ctx)`.
