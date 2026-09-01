@@ -4,7 +4,7 @@ Everything from v0.1.0 forward is documented here; the releases before it are
 in the git history only. Entries are derived from the release tags, and the
 linked PRs hold the detail.
 
-## [v0.3.0] - Unreleased
+## [v0.3.0] - 2026-09-01
 
 **No code to change for an existing consumer.** Sessions now go through a
 `howdah.TokenStore`, and the store an application gets without asking is
