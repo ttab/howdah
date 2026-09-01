@@ -258,7 +258,7 @@ worth deciding on are revocation and how far a refresh deduplicates:
 | Absolute expiry | A sealed `issued_at` the process checks | An `expires_at` column the database checks |
 | Refresh deduplication | Per process | Fleet-wide |
 | Safe with refresh token rotation at the provider | No | Yes |
-| Retiring a cookie key | Wait out the maximum session age | `Rekey` sweeps the rows; the cookies still wait |
+| Retiring a cookie key | Wait out the maximum session age | Wait out the maximum session age |
 
 Per-process deduplication is harmless until the provider rotates refresh
 tokens, at which point two replicas serving one session inside the refresh
@@ -273,10 +273,9 @@ handle a store hands back, and writes a new cookie only when that handle
 changed or when the value came in under a retired key.
 
 The interface is `Create`, `Get`, `Update`, `Reseal`, `Delete`, `Refresh` and
-`DeleteExpired`, plus an optional `Rekeyer` for a store that can re-seal what
-it holds under a new key without waiting for sessions to expire. howdah
-starts no goroutines of its own, so an application that wants expired
-sessions swept calls `DeleteExpired` on a schedule of its own.
+`DeleteExpired`. howdah starts no goroutines of its own, so an application
+that wants expired sessions swept calls `DeleteExpired` on a schedule of its
+own.
 
 ### Keeping sessions in Postgres
 
@@ -323,16 +322,15 @@ wherever the application already migrates, and it tracks its version in
 application's own. `pgstore.Migrations` is the embedded `fs.FS` for tooling
 that would rather do it itself.
 
-Two jobs the application schedules, because howdah starts no goroutines:
-`DeleteExpired(ctx, batch)` sweeps sessions past their expiry, and
-`Rekey(ctx, batch)` re-seals the table under the current key during a key
-rollover. Call either until it returns 0. `Rekey` is step 3 of the [rollover
-runbook](docs/cookies.md#11-rolling-a-key-over) and it is not optional there:
-the request path re-seals the handle in the cookie, but only a refresh
-re-seals the row it points at, so dropping the old key without the sweep ends
-the sessions of the users who were active. What it does not do is make the
-wait shorter — a cookie in a browser that sends no requests is out of reach
-whichever store you run.
+One job the application schedules, because howdah starts no goroutines:
+`DeleteExpired(ctx, batch)` sweeps sessions past their expiry. Call it until
+it returns 0.
+
+There is deliberately no sweep that re-seals rows under a new cookie key,
+because it would not shorten the wait before a retired key can be dropped:
+nothing reaches a cookie in a browser that sends no requests, whichever store
+you run. A stored session's row is re-sealed when a refresh writes it, and one
+that never refreshes is one that expires and is swept.
 
 ### Options
 

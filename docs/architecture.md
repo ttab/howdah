@@ -314,10 +314,6 @@ Seven details that are each a bug if left out, and each have a test:
   column the waiting callers poll a `refreshed_at` that never moves, burn
   their whole backoff, and then each attempt an exchange of their own — so a
   provider outage becomes *n* serialised attempts per session instead of one.
-- **`Rekey`'s write is fenced on both `key_id` and `refreshed_at`.** A sweep
-  interleaving with a refresh would otherwise commit a re-sealed copy of the
-  *old* payload over the new one, which with rotation on resurrects a revoked
-  token.
 
 `DeleteExpired` takes its batch `FOR UPDATE SKIP LOCKED` in a deterministic
 order, which is what makes the sweep on a ticker safe for two replicas at
@@ -337,12 +333,12 @@ another's row.
 is a sweep.** The handle in the cookie is re-sealed by the request that
 carries it — `Stale`, then `Reseal` — and the payload in the row is re-sealed
 when a refresh writes it, which is to say never for a session nobody is using.
-`Rekey` is what covers that second half, and it is not optional before a key
-is dropped: a user who was active has a cookie under the new key and may still
-have a row under the old one, so dropping the key without the sweep ends the
-sessions of exactly the people who were using them. What the sweep cannot do
-is shorten the wait, because nothing can reach a cookie sitting in a browser
-that makes no requests. [cookies.md §11](cookies.md#11-rolling-a-key-over) is
+**There is deliberately no sweep for that second half.** A sweep could
+re-seal the rows, but it could not reach the cookies, so it would not shorten
+the wait before a retired key can be dropped — and a sweep racing a refresh
+is how a token the provider has revoked gets written back over a live one.
+The wait is the maximum session age with a store or without it: a session that
+never refreshes is one that expires, and `DeleteExpired` takes the row. [cookies.md §11](cookies.md#11-rolling-a-key-over) is
 the runbook that puts the two halves in order.
 
 ## Pending work

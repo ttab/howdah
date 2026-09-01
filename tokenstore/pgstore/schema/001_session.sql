@@ -46,6 +46,11 @@ CREATE INDEX IF NOT EXISTS howdah_session_expires_at_idx
 CREATE INDEX IF NOT EXISTS howdah_session_subject_idx
   ON howdah_session(subject);
 
+-- key_id is read by no query. It records which cookie key a row's payload is
+-- sealed under, and the index serves the question an operator asks during a
+-- rollover: how many live sessions are still on the old key, and is it safe
+-- to drop it yet. That is an ad hoc count, deliberately not a sweep -- see
+-- the comment on Reseal in pgstore.go for why there is no sweep.
 CREATE INDEX IF NOT EXISTS howdah_session_key_id_idx
   ON howdah_session(key_id);
 

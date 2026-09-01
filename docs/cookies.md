@@ -419,14 +419,16 @@ of it should not be shown to them.
    its user comes back — there is no way to sweep outstanding cookies, in
    either mode, so this half ends by waiting out the maximum session age
    (`howdah.DefaultMaxSessionAge`, or whatever `WithMaxSessionAge` was
-   given). What a store keeps of its own is the other half, and it does not
-   move on a read at all: a stored session's payload is re-sealed when a
-   refresh writes it, which is to say never for a session nobody is using.
-   **Sweep it.** A store that implements `howdah.Rekeyer` —
-   `tokenstore/pgstore` does — re-seals its rows under key 2 with a
-   `Rekey(ctx, batch)` call, repeated until it returns 0. Skip that and step 4
-   ends the sessions of users who were *active*, whose cookies migrated at
-   step 2 while the rows they point at did not.
+   given). A stored session's row is re-sealed when a refresh writes it, and
+   one that never refreshes is one that expires and is swept by
+   `DeleteExpired`, so the wait is the same with a store as without.
+
+   **There is deliberately no sweep that re-seals rows ahead of that.** It
+   would not shorten this wait — nothing reaches a cookie in a browser that
+   sends no requests — and a sweep racing a refresh is how a token the
+   provider has revoked gets written back over a live one. If you want to
+   know whether the wait is over rather than assume it, count the live rows
+   still on the old key: `key_id` is indexed for exactly that question.
 4. **Drop the old key.** Remove `COOKIE_KEY_1` and deploy. Renumber the rest
    if you like — the numbers carry no meaning. Any straggler still holding a
    value sealed under key 1 comes back as `ErrUnknownKey`, has its cookie

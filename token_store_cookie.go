@@ -32,9 +32,10 @@ import (
 //     while the provider does not rotate refresh tokens, and an intermittent
 //     mid-session logout once it does: turning rotation on fleet-wide is a
 //     decision to move every application onto a stored session.
-//   - **It cannot be swept.** There is no Rekey, because outstanding cookies
-//     cannot be reached. A retired key has to stay in the keyring until
-//     every session sealed under it has aged out.
+//   - **A retired key has to stay in the keyring** until every session
+//     sealed under it has aged out. Nothing can reach a cookie in a browser
+//     that sends no requests, so there is no sweep to shorten that — and the
+//     Postgres store is no different, for the same reason.
 //
 // The absolute expiry it does enforce, from the sealed issued_at, which is
 // what gives store-less key retirement a defined end.
@@ -53,7 +54,7 @@ type CookieTokenStore struct {
 	refresh singleflight.Group
 }
 
-// CookieTokenStore implements TokenStore, and deliberately not Rekeyer.
+// CookieTokenStore implements TokenStore.
 var _ TokenStore = (*CookieTokenStore)(nil)
 
 // NewCookieTokenStore builds a store that seals sessions into the cookie

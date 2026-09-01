@@ -1,6 +1,6 @@
 // Package pgstore keeps howdah's sessions in Postgres. It is a
-// howdah.TokenStore and a howdah.Rekeyer, so an application hands it to
-// howdah.WithTokenStore and nothing else changes.
+// howdah.TokenStore, so an application hands it to howdah.WithTokenStore
+// and nothing else changes.
 //
 // What a row buys over a session sealed into the cookie:
 //
@@ -16,13 +16,13 @@
 //     what makes it safe to turn refresh token rotation on at the provider:
 //     without it the first exchange invalidates the refresh token and every
 //     other request comes back invalid_grant and bounces the user to login.
-//   - **A key rollover a retired key cannot spoil.** A stored session is
-//     sealed in two places, and only the handle in the cookie is re-sealed
-//     by the request that carries it; the row moves when a refresh writes
-//     it, which is to say never for a session nobody is using. Rekey
-//     re-seals the rows, so dropping the old key costs the idle sessions
-//     their cookie and nothing else. It does not make that wait shorter —
-//     nothing reaches a cookie in a browser that sends no requests.
+//   - **A key rollover on the same terms as a cookie-only session.** A
+//     stored session is sealed in two places: the handle in the cookie,
+//     re-sealed by the request that carries it, and the row's payload,
+//     re-sealed when a refresh writes it. Neither reaches a session nobody
+//     is using, so a retired key stays in the keyring until the sessions
+//     under it have aged out — the same wait as without a store, bounded by
+//     the maximum session age and swept up by DeleteExpired.
 //
 // The cookie holds a sealed handle of about ninety bytes; the tokens live in
 // the row, sealed under the same keyring, and the row id is sha256 of the
@@ -149,7 +149,6 @@ type Store struct {
 // Store implements both halves of the store contract.
 var (
 	_ howdah.TokenStore = (*Store)(nil)
-	_ howdah.Rekeyer    = (*Store)(nil)
 )
 
 // conf is the resolved configuration of a store.
@@ -505,8 +504,13 @@ func (s *Store) Update(
 // identifies is unchanged too. It is how a session that came in under a
 // retiring key migrates to the current one.
 //
-// The row's own payload is not re-sealed here. That is Rekey's job, because
-// it needs the fence a request path has no business taking.
+// The row's own payload is left alone. It is re-sealed when a refresh next
+// writes it, and a session that never refreshes is one that expires — so a
+// retiring key has to stay in the keyring until the sessions under it have
+// aged out either way. There is deliberately no sweep that re-seals rows
+// ahead of that: it would not shorten the wait, because nothing reaches a
+// cookie in a browser that sends no requests, and a sweep racing a refresh
+// is how a revoked token gets written back over a live one.
 func (s *Store) Reseal(
 	_ context.Context, t *howdah.StoredToken,
 ) (*howdah.StoredToken, error) {

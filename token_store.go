@@ -123,19 +123,6 @@ type TokenStore interface {
 	DeleteExpired(ctx context.Context, batch int) (int64, error)
 }
 
-// Rekeyer is implemented by stores that can re-seal what they hold under the
-// current key without waiting for the sessions to expire. Rekey re-seals at
-// most batch sessions and returns how many it re-sealed; call it until it
-// returns 0.
-//
-// A table can be swept, which collapses the wait before a retired key can be
-// dropped from "longer than the maximum session lifetime" to "however long
-// the sweep takes". Outstanding cookies cannot be swept, so a cookie-backed
-// store does not implement this.
-type Rekeyer interface {
-	Rekey(ctx context.Context, batch int) (int64, error)
-}
-
 // NewSession is a session at the moment it is created: what the login
 // produced, and nothing a store decides for itself. The issued_at and the
 // absolute expiry are the store's to set, which is what keeps the session

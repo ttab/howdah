@@ -110,25 +110,3 @@ SET    refresh_failed_at = now(),
        refresh_lease_until = NULL,
        refresh_lease_nonce = NULL
 WHERE  id = @id AND refresh_lease_nonce = @nonce;
-
--- Finds the live sessions sealed under some other key than the one we seal
--- with now, through the key_id index rather than by opening every row.
--- name: ListRekeySessions :many
-SELECT id, key_id, payload, refreshed_at
-FROM   howdah_session
-WHERE  key_id <> @key_id AND expires_at > now()
-ORDER BY id
-LIMIT  @batch;
-
--- Re-seals one row's payload, fenced on both the key id and the refreshed_at
--- the sweep read. Without both, a sweep that interleaves with a refresh
--- commits a re-sealed copy of the old payload over the new one — which, with
--- refresh token rotation on, resurrects a token the provider has revoked and
--- kills the session.
--- name: ResealSession :execrows
-UPDATE howdah_session
-SET    key_id = @key_id,
-       payload = @payload
-WHERE  id = @id
-  AND  key_id = @seen_key_id
-  AND  refreshed_at = @seen_refreshed_at;

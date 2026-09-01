@@ -20,9 +20,7 @@ in the cookie, enforces the absolute session expiry, and decides how far the
 deduplication of a concurrent refresh reaches — per process for the
 cookie-backed store, and callers must not assume the token exchange runs
 exactly once. Implement `Create`, `Get`, `Update`, `Reseal`, `Delete`,
-`Refresh` and `DeleteExpired`, plus the optional `howdah.Rekeyer` if the store
-can re-seal what it holds under a new key without waiting for sessions to
-expire. `howdah.ErrNoSession` is what a store returns for a handle it cannot
+`Refresh` and `DeleteExpired`. `howdah.ErrNoSession` is what a store returns for a handle it cannot
 resolve. howdah starts no goroutines, so sweeping expired sessions is a
 `DeleteExpired` call on a schedule of the application's own.
 
@@ -90,14 +88,13 @@ that would rather apply them itself.
   it.
 
 **Also to schedule, because howdah starts no goroutines:** `DeleteExpired`
-sweeps sessions past their expiry, and `Rekey` re-seals the table under the
-current cookie key during a key rollover. Call either until it returns 0.
-`Rekey` is step 3 of the rollover runbook and it is not optional there: the
-request path re-seals the handle in the cookie, but only a refresh re-seals
-the row it points at, so dropping a retired key without the sweep ends the
-sessions of the users who were active. What it does not do is shorten the wait
-before a key can be dropped — nothing reaches a cookie in a browser that sends
-no requests.
+sweeps sessions past their expiry. Call it until it returns 0.
+
+Retiring a cookie key takes the same wait with a store as without — the
+maximum session age. There is deliberately no sweep that re-seals rows under
+the new key: it could not reach the cookies, so it would not shorten that
+wait, and a sweep racing a refresh is how a token the provider has revoked
+gets written back over a live one.
 
 **Build:** the minimum Go version is now 1.26.5, raised by the
 `github.com/ttab/mage` targets howdah's magefiles import, so a consumer on Go
