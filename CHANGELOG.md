@@ -75,10 +75,15 @@ its own session lifetime.
 carries, applied against a version table of howdah's own —
 `pgstore.SchemaVersionTable`, `howdah_session_version` — so howdah's numbering
 cannot collide with the numbering of the migrations the application already
-has in the same database. **Apply them from a deliberate step, never from the
-service's startup path:** `pgstore.Migrate(ctx, pool)`, `pgstore.MigrateConn`
-for an application holding a `*pgx.Conn`, or `pgstore.Migrations` for tooling
-that would rather apply them itself.
+has in the same database. **A service on tern should vendor the migration into
+its own `./schema` instead**, with `mage sql:vendor` from `github.com/ttab/mage`
+v0.11.2 or later: `mage sql:migrate` and elephant-platform's
+`setup db migrate` apply exactly those files and neither looks inside a
+dependency, so a migration applied only from here never runs in a hosted deploy
+— the API serves normally and every login fails on a missing `howdah_session`.
+`pgstore.Migrate(ctx, pool)`, `pgstore.MigrateConn` and `pgstore.Migrations`
+remain for an application that migrates some other way. **Whichever route,
+apply them from a deliberate step and never from the service's startup path.**
 
 - `001_session.sql` — creates the `howdah_session` table and its `expires_at`,
   `subject` and `key_id` indexes. **Run it before the deploy that turns

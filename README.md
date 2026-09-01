@@ -314,13 +314,23 @@ it safe to turn refresh token rotation on at the provider.
 | `WithRefreshWait` | How long a caller waits for another caller's refresh before failing with `ErrRefreshTimeout`. |
 | `WithWriteTimeout` | Bounds the writes that must happen even though the request is gone: recording a refresh, and recording that one failed. |
 
-**The migrations are the application's to run, never the service's to run at
-startup** — a migration at startup turns every restart, scale-up and rollback
-into a schema change. `pgstore.Migrate(ctx, pool)` applies them from
-wherever the application already migrates, and it tracks its version in
+**A service on tern should vendor the migration rather than apply it from
+here.** Both `mage sql:migrate` and elephant-platform's `setup db migrate`
+apply exactly the tern files in a service's own `./schema` and neither looks
+inside a dependency, so a migration applied only through this package never
+runs in a hosted deploy — the API serves normally and every login fails on a
+missing `howdah_session`. Declare howdah in `schema/vendor.json`, run
+`mage sql:vendor`, and commit what it writes; `mage sql:vendorCheck` fails when
+a later migration has not been taken. That needs `github.com/ttab/mage`
+v0.11.2 or later.
+
+`pgstore.Migrate(ctx, pool)` and `pgstore.MigrateConn` are still there, for an
+application that migrates some other way, and they track their version in
 `howdah_session_version` so howdah's numbering cannot collide with the
-application's own. `pgstore.Migrations` is the embedded `fs.FS` for tooling
-that would rather do it itself.
+application's own. `pgstore.Migrations` is the embedded `fs.FS` behind both.
+**Whichever route, the migrations are the application's to run and never the
+service's to run at startup** — a migration at startup turns every restart,
+scale-up and rollback into a schema change.
 
 One job the application schedules, because howdah starts no goroutines:
 `DeleteExpired(ctx, batch)` sweeps sessions past their expiry. Call it until
