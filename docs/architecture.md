@@ -350,16 +350,24 @@ the runbook that puts the two halves in order.
   so a store that does not take it at creation cannot get it back — but the
   cookie-backed store drops it, having nowhere to put another JWT. `pgstore`
   keeps it, so this is a piece of work rather than a piece of work plus a
-  migration. The reasoning, and what it would take, is
-  [sealed-sessions.md §11](sealed-sessions.md#11-open-decisions), which is
-  kept for exactly that decision.
+  migration.
+
+  **Decided: it stays out of scope, as separate work.** What has to be said
+  plainly until it exists is that *revocation* here means howdah's session and
+  nothing more — ending a session strands a refresh token the provider still
+  honours, and an operator who believes otherwise will not go looking for it.
 - **`pgx` is in the module graph of every consumer.** `pgstore` is a package
   in the main module rather than a nested one, so an application with no
   database still resolves `github.com/jackc/pgx/v5` and
   `github.com/jackc/tern/v2` in its `go.sum`. Nothing links unless it is
   imported, and one module keeps a release one tag, so the trade was made
-  deliberately — but it is a trade, and a nested module is what to reach for
-  if the graph noise starts to cost something.
+  deliberately.
+
+  **Decided: one module.** The evidence is a consumer with no database:
+  imagereporting on this version resolves pgx in `go.sum` and links **zero**
+  pgx packages, by `go list -deps`, with no source change of its own. Graph
+  noise, no build or binary cost. A nested module is what to reach for if that
+  ever stops being true.
 - **A session that survives a lost write-back.** If a refresh's exchange
   succeeds and the commit then fails, the rotated token exists only in that
   process's memory, and a stored session's cookie is only a handle — so there
