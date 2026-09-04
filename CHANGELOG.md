@@ -4,7 +4,7 @@ Everything from v0.1.0 forward is documented here; the releases before it are
 in the git history only. Entries are derived from the release tags, and the
 linked PRs hold the detail.
 
-## [v0.4.1] - Unreleased
+## [v0.4.1] - 2026-09-04
 
 **New (reaching `OptionalAuth` through the authenticator):**
 `howdah.OptionalAuthenticator` is `howdah.Authenticator` plus `OptionalAuth`,
