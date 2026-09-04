@@ -31,8 +31,37 @@ type TeplateFuncSource interface {
 	GetTemplateFuncs() template.FuncMap
 }
 
+// Authenticator is what a component is handed to protect a route with: a
+// page calls RequireAuth and gets either a context carrying the session or
+// an error to return. An application that has an authorization rule of its
+// own wraps howdah's authenticator in one of these rather than leaving the
+// rule to each component — imagereporting's RoleAuth is the worked example.
 type Authenticator interface {
 	RequireAuth(
+		ctx context.Context, w http.ResponseWriter, r *http.Request,
+	) (context.Context, error)
+}
+
+// OptionalAuthenticator is an Authenticator that can also resolve a session
+// without requiring one, for a page anybody may read. *OIDCAuth is one; a
+// component that needs the reader's identity on a public page takes this
+// instead of an Authenticator, and an application that wraps the
+// authenticator forwards OptionalAuth to reach it.
+//
+// It is a second interface and not a second method on Authenticator so that
+// a wrapper which has no business serving public pages does not have to
+// answer for one. Which is also the thing to be careful about when
+// implementing it: **OptionalAuth resolves identity and settles nothing
+// about authorization.** A wrapper whose RequireAuth enforces a rule —
+// a realm role, an organisation — cannot enforce it here by returning no
+// session, because the caller cannot tell that apart from a visitor who is
+// not logged in, and neither can the page. Resolve the session, leave the
+// rule to the handler that acts on it, and keep the pages that need the
+// rule on RequireAuth.
+type OptionalAuthenticator interface {
+	Authenticator
+
+	OptionalAuth(
 		ctx context.Context, w http.ResponseWriter, r *http.Request,
 	) (context.Context, error)
 }

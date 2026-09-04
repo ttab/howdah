@@ -140,6 +140,18 @@ the `PageMux`: the mount point is the scope of the decision, and here the
 decision is "the pages under here are public and may show the reader their own
 identity". A handler under it that needs a session still calls `RequireAuth`.
 
+The method reaches a component through `OptionalAuthenticator`, which is
+`Authenticator` plus `OptionalAuth`. Two interfaces rather than one method
+added to the existing one, because the wrapping above is the whole point of
+`Authenticator` and a wrapper that serves no public pages should not have to
+answer for one. The trap on the other side is that a wrapper's `OptionalAuth`
+**cannot enforce the wrapper's rule**: a reader refused for want of a realm
+role comes back from it looking exactly like a reader who is not logged in,
+and neither the caller nor the page can tell the difference. So a wrapper
+forwards the resolution and keeps its rule in `RequireAuth`, which is the
+same conclusion the "store cannot answer" row reaches from the other
+direction.
+
 ## The hook system
 
 `Hooks[D, T]` is two-phase on purpose. Build hooks contribute; alter hooks see

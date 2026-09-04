@@ -396,7 +396,8 @@ cosmetic, is [docs/cookies.md §10](docs/cookies.md#10-when-a-login-fails).
 
 ### Protecting routes
 
-Use `OIDCAuth` as an `Authenticator`. Call `RequireAuth` at the start of a
+Use `OIDCAuth` as an `Authenticator` — or as an `OptionalAuthenticator`,
+which adds the `OptionalAuth` below. Call `RequireAuth` at the start of a
 handler to ensure the user is logged in:
 
 ```go
@@ -492,11 +493,28 @@ session that had already resolved, which is a fault in the process rather than
 anything about the visitor. The middleware logs it and serves the request
 anonymously.
 
-`howdah.Authenticator` is still the one method, `RequireAuth`, so a component
-that wants to call `OptionalAuth` in a handler of its own holds a
-`*howdah.OIDCAuth` or an interface of its own that names it. Nothing is needed
-from the component for the middleware route — the handler just reads
-`howdah.AccessToken(ctx)` and finds it there or does not.
+A component that calls `OptionalAuth` in a handler of its own takes a
+`howdah.OptionalAuthenticator` rather than a `howdah.Authenticator`. It is
+`Authenticator` plus `OptionalAuth`, and `*howdah.OIDCAuth` satisfies it, so
+an application that wraps the authenticator forwards the method to reach it:
+
+```go
+func (a *RoleAuth) OptionalAuth(
+    ctx context.Context, w http.ResponseWriter, r *http.Request,
+) (context.Context, error) {
+    // Resolve the session, and nothing else. The role requirement stays in
+    // RequireAuth: a reader without the role who is refused here is
+    // indistinguishable from one who is not logged in, which is not
+    // something the page can act on.
+    return a.auth.OptionalAuth(ctx, w, r)
+}
+```
+
+**A wrapper's `OptionalAuth` resolves identity and settles nothing about
+authorization**, which is the same warning from the other side: a rule that
+matters is enforced in `RequireAuth`, on a page that requires the session.
+Nothing is needed from the component for the middleware route — the handler
+just reads `howdah.AccessToken(ctx)` and finds it there or does not.
 
 ## Cookies and session keys
 

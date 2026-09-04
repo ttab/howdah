@@ -22,6 +22,10 @@ type OIDCUserInfoSource interface {
 	OIDCUserInfo(ctx context.Context) (*oidc.UserInfo, error)
 }
 
+// Both halves of the pair, so that a change to either method's signature
+// fails here rather than in whichever application wraps it.
+var _ OptionalAuthenticator = (*OIDCAuth)(nil)
+
 // LoginCallback is called after a successful OIDC callback and token
 // verification, before the session cookie is set. The IDToken is the verified
 // ID token from the provider — use Claims() to extract custom claims. Return

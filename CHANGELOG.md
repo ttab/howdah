@@ -4,6 +4,28 @@ Everything from v0.1.0 forward is documented here; the releases before it are
 in the git history only. Entries are derived from the release tags, and the
 linked PRs hold the detail.
 
+## [v0.4.1] - Unreleased
+
+**New (reaching `OptionalAuth` through the authenticator):**
+`howdah.OptionalAuthenticator` is `howdah.Authenticator` plus `OptionalAuth`,
+and `*howdah.OIDCAuth` satisfies it. v0.4.0 left the method reachable only on
+the concrete type, so a component handed a wrapped authenticator — the
+pattern howdah's own docs recommend — could not call it at all. `Authenticator`
+is unchanged, so nothing an application already implements has to grow a
+method: a wrapper that serves public pages forwards `OptionalAuth` and hands
+components the wider interface, and one that does not carries on as it is.
+**A wrapper's `OptionalAuth` must not enforce the wrapper's own rule** — a
+reader refused for want of a realm role is indistinguishable from a reader who
+is not logged in, to the caller and to the page alike — so it forwards the
+resolution and keeps the rule in `RequireAuth`.
+
+Changes:
+
+- Documentation: the README's "Public pages that know who is reading them"
+  shows the forwarding method a wrapping authenticator needs, and
+  `docs/architecture.md` says why this is a second interface rather than a
+  second method on the first.
+
 ## [v0.4.0] - 2026-09-04
 
 **Behaviour change (cross-site writes are refused):** a `POST`, `PUT`,
