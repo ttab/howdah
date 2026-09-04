@@ -56,6 +56,9 @@ http.ServeMux
   ▼
 PageMux.Handle
   │
+  ├─ set Content-Security-Policy: frame-ancestors 'none'
+  ├─ a write from another site? ──→ 403 error page
+  │
   ├─ handler(ctx, w, r) → (*Page, error)
   │     │
   │     ├─ error is ErrSkipRender  ──→ return, write nothing
@@ -70,6 +73,32 @@ PageMux.Handle
   │                    ├─ mark the active menu item by matching r.URL.Path
   │                    └─ execute Page.Template with the i18n funcs bound
 ```
+
+**Both guards are on the `PageMux` and not on the caller's `http.ServeMux`,
+and that is the whole of their scope.** A consumer serves more than pages off
+the same mux — an embeddable widget, an API endpoint, a webhook receiver — and
+those are the things that legitimately are framed or are posted to from
+somewhere else. Wrapping the outer mux would break them; putting the guards on
+the route registration means the mount point *is* the opt-out, and it is one a
+reviewer can see.
+
+**The site check is the half of CSRF that `SameSite=Lax` does not cover.**
+Same-site is the registrable domain plus the scheme, so every application on
+our own domain is same-site with every other one, and a page served by a
+sibling can post at us with the session cookie attached in full. The cookie
+attribute decides what the browser sends; the check decides what we act on.
+Tightening the cookie to `Strict` instead is not available — it would withhold
+`state` and `nonce` on the OIDC callback, which is the one request that
+compares them (cookies.md §2).
+
+`Sec-Fetch-Site` is the primary signal because the browser sets it and script
+cannot: `same-origin` is our own page, `none` is the visitor with a bookmark,
+and `same-site` and `cross-site` are both refused. `Origin` is the fallback
+for a client that sends no `Sec-Fetch-Site`, and only the hosts are compared —
+behind a TLS-terminating ingress the scheme the request arrived on is not the
+scheme the browser used. A request with neither header is allowed: it is not a
+browser, and every browser that can be talked into a cross-site POST sends one
+of the two.
 
 **`PageMux` does not authenticate anything.** There is no route-level auth
 hook: a handler that needs a session calls `RequireAuth` itself. That is a

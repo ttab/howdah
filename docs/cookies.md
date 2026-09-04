@@ -62,7 +62,11 @@ cookie:
 * `SameSite=Lax`, and deliberately not `Strict`. The OIDC callback is a
   cross-site top-level navigation from the provider, so `Strict` would have
   the browser withhold `state` and `nonce` on exactly the request that
-  compares them, breaking every login.
+  compares them, breaking every login. `Lax` is a *same-site* rule, so it does
+  not keep a sibling application on our own registrable domain from posting at
+  us with the session cookie attached — that is refused on the way in instead,
+  by the `Sec-Fetch-Site` check in
+  [architecture.md](architecture.md#the-request-pipeline).
 * `Secure`, unconditionally. It is not derived from the connection, which is
   plain http behind a TLS-terminating ingress, and not from
   `X-Forwarded-Proto`, which the client sets.

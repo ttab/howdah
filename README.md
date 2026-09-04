@@ -111,6 +111,26 @@ The mux takes care of rendering the page or handling errors. If a handler
 returns an error, it is rendered as an error page. Return `ErrSkipRender`
 to signal that the handler already wrote its own response (e.g. a redirect).
 
+Two protections come with the routes, and neither is configurable:
+
+* **A write has to come from this application.** A `POST`, `PUT`, `PATCH` or
+  `DELETE` is refused with a 403 unless `Sec-Fetch-Site` is `same-origin` or
+  `none` — or, for a client that sends no `Sec-Fetch-Site`, unless `Origin`
+  names the host the request was addressed to. A request with neither header
+  is not a browser request and is let through. This is the half of CSRF that
+  `SameSite=Lax` does not cover: same-site is the registrable domain, so a
+  sibling application on our own domain can post at us with the session cookie
+  attached. The refusal renders through the error page, so the locale files
+  want a `CrossSiteRequestBlocked` message.
+* **Pages refuse to be framed.** Every response carries
+  `Content-Security-Policy: frame-ancestors 'none'`. A handler that needs a
+  different policy sets the header itself.
+
+Both apply to routes registered on the `PageMux` and to nothing else, so a
+webhook receiver, an API endpoint or an embeddable widget mounted directly on
+the `http.ServeMux` is unaffected — which is also where a route that is
+legitimately posted to from another origin belongs.
+
 ### Page
 
 A `Page` describes what to render:
@@ -415,8 +435,10 @@ anyone out. `state` and `nonce` are left in the clear on purpose.
 Every cookie howdah sets carries the same attributes and nothing configures
 them per cookie: `HttpOnly`, `SameSite=Lax` (not `Strict` — that would break
 every login), `Secure` unconditionally, a `Path` inside the mount point, and
-no `Domain`, so every cookie is host-only. `howdah.WithInsecureCookies()` is
-the one opt-out, for a plain-http local run:
+no `Domain`, so every cookie is host-only. What `Lax` leaves open is covered
+on the way in instead, by the cross-site write check in
+[PageMux and PageHandlers](#pagemux-and-pagehandlers).
+`howdah.WithInsecureCookies()` is the one opt-out, for a plain-http local run:
 
 ```go
 auth, err := howdah.NewOIDCAuth(provider, verifier, oauth2Config, keyring,

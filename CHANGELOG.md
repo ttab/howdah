@@ -4,6 +4,39 @@ Everything from v0.1.0 forward is documented here; the releases before it are
 in the git history only. Entries are derived from the release tags, and the
 linked PRs hold the detail.
 
+## [v0.4.0] - Unreleased
+
+**Behaviour change (cross-site writes are refused):** a `POST`, `PUT`,
+`PATCH` or `DELETE` that reaches a route registered on a `PageMux` is now
+answered with a 403 error page unless the browser says the request came from
+this application — `Sec-Fetch-Site: same-origin` or `none`, or, for a client
+that sends no `Sec-Fetch-Site`, an `Origin` whose host is the host the request
+was addressed to. A request carrying neither header is not a browser request
+and is let through, so command-line clients and health checks are unaffected.
+This closes the same-site CSRF that `SameSite=Lax` leaves open: same-site is
+the registrable domain, so every application on our own domain can post at
+every other one with the session cookie attached. What a consumer has to do:
+add a `CrossSiteRequestBlocked` message to the locale files, and check any
+route of their own that is posted to by something other than one of their own
+pages — a webhook receiver or a form on another host belongs on the
+`http.ServeMux` rather than on the `PageMux`.
+
+**Behaviour change (UI pages refuse to be framed):** every response a
+`PageMux` route produces now carries `Content-Security-Policy:
+frame-ancestors 'none'`. An application that is deliberately embedded in an
+iframe has to set the header itself in the handler, which overwrites this one.
+Nothing mounted directly on the underlying `http.ServeMux` is touched, so an
+embeddable widget or an API endpoint served next to the UI keeps the headers
+it had.
+
+Changes:
+
+- The site check and the framing policy are the whole of the release; both are
+  `PageMux` behaviour and neither has an option, because a framework that lets
+  a page opt out of them is a framework where the opt-out is the thing that
+  gets copied. `docs/architecture.md` records the reasoning under "The request
+  pipeline" and the README lists both under "PageMux and PageHandlers".
+
 ## [v0.3.0] - 2026-09-01
 
 **No code to change for an existing consumer.** Sessions now go through a
