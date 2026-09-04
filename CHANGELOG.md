@@ -4,7 +4,7 @@ Everything from v0.1.0 forward is documented here; the releases before it are
 in the git history only. Entries are derived from the release tags, and the
 linked PRs hold the detail.
 
-## [v0.4.0] - Unreleased
+## [v0.4.0] - 2026-09-04
 
 **Behaviour change (cross-site writes are refused):** a `POST`, `PUT`,
 `PATCH` or `DELETE` that reaches a route registered on a `PageMux` is now
