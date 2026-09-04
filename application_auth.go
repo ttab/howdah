@@ -368,6 +368,22 @@ func (a *OIDCAuth) OIDCUserInfo(ctx context.Context) (*oidc.UserInfo, error) {
 	return info, nil
 }
 
+// RequireAuth resolves the request's session and returns a context that
+// carries it, or sends the visitor to the login page. A page that may be
+// read by somebody who is not logged in calls OptionalAuth instead.
+//
+// On success the returned context carries an Authorization header for
+// anything the handler calls over Twirp, and the token set and verified
+// access token for the handler itself — Token and AccessToken. An access
+// token inside the refresh margin is refreshed on the way, and the session
+// cookie is rewritten when the store's handle moved or the value came in
+// under a retiring key.
+//
+// A session cookie that cannot be used is cleared and the visitor is sent
+// to log in again. A session that merely could not be *resolved* — a store
+// that would not answer — is a 503 HTTPError instead, and the cookie is
+// left alone: the session is very likely still there and the cookie may be
+// the only handle to it. See sessionGone.
 func (a *OIDCAuth) RequireAuth(
 	ctx context.Context, w http.ResponseWriter, r *http.Request,
 ) (context.Context, error) {
@@ -421,11 +437,142 @@ func (a *OIDCAuth) RequireAuth(
 		return ctx, ErrSkipRender
 	}
 
+	authCtx, err := sessionContext(ctx, token, accessToken)
+	if err != nil {
+		return ctx, err
+	}
+
+	return authCtx, nil
+}
+
+// OptionalAuth resolves the request's session the way RequireAuth does, and
+// leaves a visitor who has none anonymous instead of sending them to log
+// in. It is what a public page uses to know who is reading it — a name in
+// the header, the reader's own organisation marked in a listing — while
+// staying readable to somebody who is not logged in at all.
+//
+// A request that carries a usable session comes out of this exactly as it
+// would out of RequireAuth: the tokens are resolved through the store, an
+// access token inside the refresh margin is refreshed, the session cookie
+// is rewritten when the handle moved or came in under a retiring key, and
+// the returned context carries the Authorization header, Token and
+// AccessToken. Everything else returns the context it was handed and a nil
+// error, so the handler renders the page for an anonymous reader.
+//
+// Three failures reach that outcome, and none of them is reported to the
+// caller, because a public page has the same thing to do about all three:
+//
+//   - There is no session cookie. The ordinary anonymous visitor.
+//   - The cookie cannot be used — unsealed, sealed under a key that is
+//     gone, tampered with, unknown to the store, past the maximum session
+//     age, or holding a refresh token the provider refused. It is cleared
+//     exactly as RequireAuth clears it, so the browser stops sending it.
+//   - The store could not answer. RequireAuth fails the request with a 503
+//     there, since a page that cannot be rendered is better than one that
+//     silently drops the user's session; a public page has a third option
+//     and takes it. The cookie is left alone — the session is very likely
+//     still there and the cookie may be the only handle to it — and the
+//     failure is logged at error level by readTokenCookie, which is what
+//     the taxonomy calls for whether or not this request could route
+//     around it.
+//
+// The error it does return is a failure to build the context around a
+// session it had already resolved, which is a fault in this process rather
+// than anything about the visitor. Nothing else in it writes to w beyond
+// the Set-Cookie the session itself calls for: there is no redirect and no
+// error page, so the handler always gets to render.
+func (a *OIDCAuth) OptionalAuth(
+	ctx context.Context, w http.ResponseWriter, r *http.Request,
+) (context.Context, error) {
+	// readTokenCookie has already logged whatever the failure was worth,
+	// at the level the failure taxonomy calls for, and cleared the cookie
+	// if it was unusable — including the cookie it deliberately left
+	// alone because the store, and not the session, was the problem.
+	session, err := a.readTokenCookie(w, r)
+	if err != nil {
+		return ctx, nil
+	}
+
+	token, err := a.checkTokenExpiry(w, r, session)
+	if err != nil {
+		slog.ErrorContext(ctx, "resolve the session", "err", err)
+
+		if sessionGone(err) {
+			// As in RequireAuth: the refresh was refused, so the
+			// cookie is dead and stays dead until the user logs in
+			// again. Clearing it keeps the browser from sending it
+			// along to every page they read anonymously.
+			a.clearTokenCookie(w)
+		}
+
+		return ctx, nil
+	}
+
+	// The same assumption RequireAuth makes: that the access token is a
+	// JWT this provider's keys verify.
+	accessToken, err := a.accessVerifier.Verify(ctx, token.AccessToken)
+	if err != nil {
+		// Logged at error level, as in RequireAuth. A session whose
+		// access token does not verify is not a session anything may
+		// act on, and it is not something a visitor caused.
+		slog.ErrorContext(ctx, "verify access token", "err", err)
+
+		return ctx, nil
+	}
+
+	authCtx, err := sessionContext(ctx, token, accessToken)
+	if err != nil {
+		return ctx, err
+	}
+
+	return authCtx, nil
+}
+
+// OptionalAuthMiddleware applies OptionalAuth to every request that passes
+// through it and hands the resulting context on, so that a whole mux of
+// public pages can know who is reading them without every handler asking.
+// A request OptionalAuth leaves anonymous continues unchanged.
+//
+// It is middleware and not a PageMux hook because that is the scope of the
+// decision: mounting it is what says "the pages under here are public, and
+// may show the reader their own identity". A handler that must have a
+// session still calls RequireAuth, whether or not this ran first.
+func (a *OIDCAuth) OptionalAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, err := a.OptionalAuth(r.Context(), w, r)
+		if err != nil {
+			slog.ErrorContext(r.Context(),
+				"set up the optional session", "err", err)
+
+			// The only failure OptionalAuth reports says nothing
+			// about the visitor, and these pages are public: the
+			// request continues without a session rather than
+			// turning into an error page.
+			next.ServeHTTP(w, r)
+
+			return
+		}
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// sessionContext is what an authenticated request carries: the access token
+// in an Authorization header for anything the handler calls over Twirp, and
+// the token set and the verified access token for the handler itself.
+//
+// It is a function of its own so that a session resolved through
+// RequireAuth and one resolved through OptionalAuth carry exactly the same
+// things — a page that renders for both would otherwise be reading whatever
+// the last change to one of them happened to leave in place.
+func sessionContext(
+	ctx context.Context, token *oauth2.Token, accessToken *oidc.IDToken,
+) (context.Context, error) {
 	authCtx, err := twirp.WithHTTPRequestHeaders(ctx, http.Header{
 		"Authorization": []string{fmt.Sprintf("Bearer %s", token.AccessToken)},
 	})
 	if err != nil {
-		return ctx, NewHTTPError(http.StatusInternalServerError,
+		return nil, NewHTTPError(http.StatusInternalServerError,
 			"FailedToSetUpSession", "Failed to set up session", err)
 	}
 

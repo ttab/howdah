@@ -109,6 +109,37 @@ control rather than in howdah. imagereporting's `RoleAuth` is the worked
 example: it wraps howdah's authenticator, adds a realm-role requirement, and
 components never see the unwrapped one.
 
+**A page that anybody may read calls `OptionalAuth` instead**, and the two
+share every step of the resolution: `readTokenCookie`, `checkTokenExpiry`, the
+access token verification, and `sessionContext` — which is a function of its
+own precisely so that a session resolved either way carries the same things.
+Only the failure branches differ, and they differ in one interesting place.
+
+```
+                       RequireAuth                 OptionalAuth
+no session cookie      302 → login                 anonymous
+cookie unusable        cookie cleared, 302         cookie cleared, anonymous
+access token bad       302, cookie left alone      anonymous, cookie left alone
+store cannot answer    503, cookie left alone      anonymous, cookie left alone
+context setup failed   500                         500
+```
+
+The "store cannot answer" row is the judgement rather than the plumbing. A
+store that could not answer says nothing about whether there is a session, so
+`RequireAuth` refuses to guess and fails the request; a public page has a
+third option and takes it, because a page nobody can read is a worse outcome
+there than a page rendered without a name in the header. **What follows is
+that an authorization decision may never rest on `OptionalAuth` having found a
+session** — a database failover would read as "not logged in" — so anything a
+visitor must be logged in for goes through `RequireAuth`, whose 503 is the
+whole point.
+
+`OptionalAuthMiddleware` applies it to a whole `http.ServeMux`. It is
+middleware and not a `PageMux` hook for the same reason the site check *is* on
+the `PageMux`: the mount point is the scope of the decision, and here the
+decision is "the pages under here are public and may show the reader their own
+identity". A handler under it that needs a session still calls `RequireAuth`.
+
 ## The hook system
 
 `Hooks[D, T]` is two-phase on purpose. Build hooks contribute; alter hooks see

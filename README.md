@@ -426,6 +426,78 @@ still there and the cookie may be the only handle to it. On success it adds an
 services via Twirp) and stores the verified access token, retrievable with
 `howdah.AccessToken(ctx)`.
 
+### Public pages that know who is reading them
+
+`OptionalAuth` is `RequireAuth` for a page that anybody may read: it resolves
+the session when there is one and leaves the visitor anonymous when there is
+not, instead of redirecting to the login page.
+
+```go
+func (c *MyComponent) handlePublicPage(
+    ctx context.Context, w http.ResponseWriter, r *http.Request,
+) (*Page, error) {
+    ctx, err := c.auth.OptionalAuth(ctx, w, r)
+    if err != nil {
+        return nil, err
+    }
+
+    // ok is false for a visitor who is not logged in, and the page
+    // renders for them too.
+    accessToken, ok := howdah.AccessToken(ctx)
+    // ...
+}
+```
+
+A request that carries a usable session comes out of it exactly as it would
+out of `RequireAuth` — resolved through the store, refreshed if the access
+token was inside the refresh margin, the session cookie rewritten if the
+handle moved or came in under a retiring key, and `howdah.Token` and
+`howdah.AccessToken` working on the returned context. Everything else returns
+the context unchanged and a nil error: no cookie, a cookie that cannot be used
+(which is cleared, exactly as `RequireAuth` clears it), an access token this
+provider's keys do not verify, or a store that could not answer. That last
+one is the one difference in judgement rather than in plumbing: `RequireAuth`
+fails the request with a 503, while a public page renders for a reader who is
+not logged in and leaves the cookie alone. **So a handler must not read a
+page's authorization out of whether `OptionalAuth` found a session** — a
+database failover would then read as "not logged in". Anything that must have
+a session calls `RequireAuth`.
+
+`OptionalAuthMiddleware` is the same thing as `http.Handler` middleware, for
+wrapping a whole mux of public pages so that no handler under it has to ask:
+
+```go
+appMux := http.NewServeMux()
+
+app, err := howdah.NewApplication(
+    logger, appMux, templates, locales, assets, components)
+// ...
+
+server := http.Server{
+    Addr:    ":1080",
+    Handler: auth.OptionalAuthMiddleware(appMux),
+}
+```
+
+Wrapping the application's whole mux resolves the session for howdah's own
+`/auth/…` routes too, which is harmless — nothing in the login flow reads the
+session from the context — and for every asset request the application serves,
+which is not free: each one becomes a store read, cheap for the cookie-backed
+store and a database round trip for `pgstore`. A mux holding only the public
+pages is the tidier scope for both reasons, and it is the mount point that
+says which pages those are.
+
+The error return covers one thing, a failure to build the context around a
+session that had already resolved, which is a fault in the process rather than
+anything about the visitor. The middleware logs it and serves the request
+anonymously.
+
+`howdah.Authenticator` is still the one method, `RequireAuth`, so a component
+that wants to call `OptionalAuth` in a handler of its own holds a
+`*howdah.OIDCAuth` or an interface of its own that names it. Nothing is needed
+from the component for the middleware route — the handler just reads
+`howdah.AccessToken(ctx)` and finds it there or does not.
+
 ## Cookies and session keys
 
 The session cookie and the post-login redirect cookie (`auth_redir`) are

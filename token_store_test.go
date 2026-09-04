@@ -524,6 +524,35 @@ func TestSessionSurvivesAStoreThatCannotAnswer(t *testing.T) {
 
 				assertSessionCookie(t, w, auth, test.gone)
 			})
+
+			// A public page renders for a reader who is not logged in
+			// whichever way the session failed, so OptionalAuth has
+			// the same answer for every row: no session, no error,
+			// and the same cookie treatment. The 503 RequireAuth
+			// produces has no counterpart here — a store that cannot
+			// answer is not a reason to fail a page that never needed
+			// the session in the first place.
+			t.Run("OptionalAuth", func(t *testing.T) {
+				store := test.store()
+				auth := newStoreAuth(t, withBrokenSession(store))
+
+				w := httptest.NewRecorder()
+				r := requestWithSession(auth, "row-handle")
+
+				ctx, err := auth.OptionalAuth(r.Context(), w, r)
+				if err != nil {
+					t.Fatalf("optional auth: %v", err)
+				}
+
+				assertAnonymous(t, ctx)
+
+				if got := w.Header().Get("Location"); got != "" {
+					t.Errorf("the response redirects to %q, want no redirect",
+						got)
+				}
+
+				assertSessionCookie(t, w, auth, test.gone)
+			})
 		})
 	}
 }

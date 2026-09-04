@@ -29,13 +29,40 @@ Nothing mounted directly on the underlying `http.ServeMux` is touched, so an
 embeddable widget or an API endpoint served next to the UI keeps the headers
 it had.
 
+**New (public pages that know who is reading them):**
+`howdah.OIDCAuth.OptionalAuth` is `RequireAuth` for a page anybody may read:
+it resolves the session when there is one and leaves the visitor anonymous
+when there is not, rather than redirecting to the login page. A usable session
+comes out of it exactly as it would out of `RequireAuth` — resolved through
+the store, refreshed if the access token was inside the refresh margin, the
+session cookie rewritten if the handle moved or came in under a retiring key,
+and `howdah.Token` and `howdah.AccessToken` working on the context it returns.
+Everything else returns the context unchanged with a nil error: no cookie, a
+cookie that cannot be used (which it clears, exactly as `RequireAuth` does),
+an access token the provider's keys do not verify, or a store that could not
+answer — where `RequireAuth`'s 503 becomes an anonymous render with the cookie
+left alone. **So an authorization decision must never rest on `OptionalAuth`
+having found a session**, since a database failover would then read as "not
+logged in"; anything that requires one keeps calling `RequireAuth`.
+`howdah.OIDCAuth.OptionalAuthMiddleware` applies it to a whole
+`http.ServeMux`, for an application whose public pages all want it — at one
+store read per request through it, assets included, so the tidier mount point
+is a mux holding only those pages. An application that was reading the session
+cookie itself to get at the logged-in user on a public page can now drop that
+code — and has had to since v0.2.0, when the cookie value became a sealed
+envelope.
+
 Changes:
 
-- The site check and the framing policy are the whole of the release; both are
-  `PageMux` behaviour and neither has an option, because a framework that lets
-  a page opt out of them is a framework where the opt-out is the thing that
-  gets copied. `docs/architecture.md` records the reasoning under "The request
-  pipeline" and the README lists both under "PageMux and PageHandlers".
+- Neither the site check nor the framing policy has an opt-out, because a
+  framework that lets a page opt out of them is a framework where the opt-out
+  is the thing that gets copied; both are `PageMux` behaviour.
+  `docs/architecture.md` records the reasoning under "The request pipeline"
+  and the README lists both under "PageMux and PageHandlers".
+- Documentation: the README has "Public pages that know who is reading them",
+  and `docs/architecture.md` tables `RequireAuth` and `OptionalAuth` against
+  each other failure branch by failure branch, since the one row they differ
+  on in judgement rather than in plumbing is the one worth knowing about.
 
 ## [v0.3.0] - 2026-09-01
 

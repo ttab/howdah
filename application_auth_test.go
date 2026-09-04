@@ -3,10 +3,15 @@ package howdah
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +21,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/twitchtv/twirp"
 	"golang.org/x/oauth2"
 )
 
@@ -72,6 +78,181 @@ func newTestProvider(t *testing.T, handler http.HandlerFunc) *oidc.Provider {
 	}
 
 	return conf.NewProvider(context.Background())
+}
+
+const (
+	// testIDPKeyID names the one key newTestIDP signs with, in both the
+	// JWKS it serves and the JWT header, since a remote key set picks the
+	// key by kid.
+	testIDPKeyID = "test-key"
+
+	// testIDPRefreshedSubject is the subject of the access token the test
+	// provider's token endpoint hands back, so that a test can tell a
+	// context built from a refreshed session from one built from the
+	// session that arrived in the cookie.
+	testIDPRefreshedSubject = "refreshed-reader"
+)
+
+// testIDP is a provider whose signing keys can actually be fetched: it
+// serves a JWKS and mints RS256 access tokens against it.
+//
+// It exists because RequireAuth and OptionalAuth verify the access token
+// before they will build a context around a session, so a test that follows
+// either of them all the way to a resolved session cannot use the empty
+// provider the rest of the suite gets by with.
+type testIDP struct {
+	provider *oidc.Provider
+	issuer   string
+	key      *rsa.PrivateKey
+
+	// refreshedAccessToken is the access token the token endpoint answers
+	// a refresh with. It is minted once, at construction, because the
+	// endpoint is served from the test server's own goroutine, where a
+	// t.Fatalf would be a testing misuse rather than a failed test.
+	refreshedAccessToken string
+	refreshResponse      []byte
+
+	// refreshes counts the token endpoint round trips, which is how a
+	// test says whether the session was refreshed on the way through.
+	refreshes atomic.Int64
+}
+
+func newTestIDP(t *testing.T) *testIDP {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate the signing key: %v", err)
+	}
+
+	idp := &testIDP{key: key}
+
+	jwks, err := json.Marshal(map[string]any{
+		"keys": []map[string]any{{
+			"kty": "RSA",
+			"use": "sig",
+			"alg": "RS256",
+			"kid": testIDPKeyID,
+			"n": base64.RawURLEncoding.EncodeToString(
+				key.N.Bytes()),
+			"e": base64.RawURLEncoding.EncodeToString(
+				big.NewInt(int64(key.E)).Bytes()),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal the jwks: %v", err)
+	}
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /jwks", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		_, err := w.Write(jwks)
+		if err != nil {
+			t.Errorf("write the jwks: %v", err)
+		}
+	})
+
+	mux.HandleFunc("POST /token", func(w http.ResponseWriter, _ *http.Request) {
+		idp.refreshes.Add(1)
+
+		w.Header().Set("Content-Type", "application/json")
+
+		_, err := w.Write(idp.refreshResponse)
+		if err != nil {
+			t.Errorf("write the token response: %v", err)
+		}
+	})
+
+	server := httptest.NewServer(mux)
+
+	t.Cleanup(server.Close)
+
+	idp.issuer = server.URL
+
+	conf := oidc.ProviderConfig{
+		IssuerURL: server.URL,
+		AuthURL:   server.URL + "/auth",
+		TokenURL:  server.URL + "/token",
+		JWKSURL:   server.URL + "/jwks",
+	}
+
+	idp.provider = conf.NewProvider(context.Background())
+
+	idp.refreshedAccessToken = idp.accessToken(
+		t, testIDPRefreshedSubject, time.Now().Add(time.Hour))
+
+	idp.refreshResponse, err = json.Marshal(map[string]any{
+		"access_token":  idp.refreshedAccessToken,
+		"token_type":    "Bearer",
+		"refresh_token": "new-refresh",
+		"expires_in":    3600,
+	})
+	if err != nil {
+		t.Fatalf("marshal the token response: %v", err)
+	}
+
+	return idp
+}
+
+// accessToken mints an access token the way the provider does: an RS256 JWT
+// signed by the key the JWKS advertises. The subject is what a test reads
+// back out of the context to say which token the request ended up carrying.
+func (idp *testIDP) accessToken(
+	t *testing.T, subject string, expiry time.Time,
+) string {
+	t.Helper()
+
+	header := idp.jwtSegment(t, map[string]any{
+		"alg": "RS256",
+		"typ": "JWT",
+		"kid": testIDPKeyID,
+	})
+
+	claims := idp.jwtSegment(t, map[string]any{
+		"iss": idp.issuer,
+		"sub": subject,
+		"aud": "test",
+		"iat": time.Now().Unix(),
+		"exp": expiry.Unix(),
+	})
+
+	signed := header + "." + claims
+
+	digest := sha256.Sum256([]byte(signed))
+
+	signature, err := rsa.SignPKCS1v15(
+		rand.Reader, idp.key, crypto.SHA256, digest[:])
+	if err != nil {
+		t.Fatalf("sign the access token: %v", err)
+	}
+
+	return signed + "." + base64.RawURLEncoding.EncodeToString(signature)
+}
+
+func (idp *testIDP) jwtSegment(t *testing.T, value map[string]any) string {
+	t.Helper()
+
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal a jwt segment: %v", err)
+	}
+
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+// sessionFor returns the session cookie value for a session whose access
+// token this provider signed, along with the token that went into it.
+func (idp *testIDP) sessionFor(
+	t *testing.T, auth *OIDCAuth, subject string, expiry time.Time,
+) (*oauth2.Token, string) {
+	t.Helper()
+
+	token := testToken(expiry)
+	token.AccessToken = idp.accessToken(t, subject, expiry)
+
+	return token, sealTestSession(t, auth, token, time.Now().Add(-time.Minute))
 }
 
 // tokenResponse answers a refresh the way a provider's token endpoint
@@ -1361,5 +1542,343 @@ func TestRefreshExchangeHonoursTheCallersDeadline(t *testing.T) {
 	if token.AccessToken != "new-access" {
 		t.Errorf("got the access token %q, want %q",
 			token.AccessToken, "new-access")
+	}
+}
+
+// assertAnonymous checks that a context carries no session at all, which is
+// what a page rendered for somebody who is not logged in has to see. A
+// half-populated context would be worse than either outcome: a template
+// reading the token would render a name for a session the request never
+// resolved.
+func assertAnonymous(t *testing.T, ctx context.Context) {
+	t.Helper()
+
+	if token, ok := Token(ctx); ok {
+		t.Errorf("the context carries the OAuth2 token %q, want none",
+			token.AccessToken)
+	}
+
+	if accessToken, ok := AccessToken(ctx); ok {
+		t.Errorf("the context carries a verified access token for %q, want none",
+			accessToken.Subject)
+	}
+
+	if headers, ok := twirp.HTTPRequestHeaders(ctx); ok {
+		t.Errorf("the context carries the Twirp header %q, want none",
+			headers.Get("Authorization"))
+	}
+}
+
+// assertSessionContext checks everything a resolved session puts in the
+// context: the token set for the handler, the verified access token for the
+// claims, and the Authorization header for whatever the handler calls over
+// Twirp. All three, because it is the set of them RequireAuth and
+// OptionalAuth have to agree on.
+func assertSessionContext(
+	t *testing.T, ctx context.Context, subject string, accessToken string,
+) {
+	t.Helper()
+
+	token, ok := Token(ctx)
+	if !ok {
+		t.Fatal("the context carries no OAuth2 token")
+	}
+
+	if token.AccessToken != accessToken {
+		t.Errorf("the context's access token is %q, want %q",
+			token.AccessToken, accessToken)
+	}
+
+	verified, ok := AccessToken(ctx)
+	if !ok {
+		t.Fatal("the context carries no verified access token")
+	}
+
+	if verified.Subject != subject {
+		t.Errorf("the verified access token's subject is %q, want %q",
+			verified.Subject, subject)
+	}
+
+	headers, ok := twirp.HTTPRequestHeaders(ctx)
+	if !ok {
+		t.Fatal("the context carries no Twirp request headers")
+	}
+
+	if got, want := headers.Get("Authorization"),
+		"Bearer "+accessToken; got != want {
+		t.Errorf("the Authorization header is %q, want %q", got, want)
+	}
+}
+
+// TestOptionalAuthWithoutASession is the ordinary anonymous visitor: no
+// cookie, so no redirect, no error and nothing in the context. This is the
+// case that makes the method worth having — RequireAuth answers it with a
+// 302 to the login page, which is not something a public page may do.
+func TestOptionalAuthWithoutASession(t *testing.T) {
+	auth := newTestAuth(t)
+
+	r := httptest.NewRequest("GET", "/things/", nil)
+	w := httptest.NewRecorder()
+
+	ctx, err := auth.OptionalAuth(t.Context(), w, r)
+	if err != nil {
+		t.Fatalf("optional auth: %v", err)
+	}
+
+	assertAnonymous(t, ctx)
+
+	if got := w.Header().Get("Location"); got != "" {
+		t.Errorf("the response redirects to %q, want no redirect", got)
+	}
+
+	if got := setCookies(w, auth.cookieName); len(got) != 0 {
+		t.Errorf("the response wrote %d session cookies, want none",
+			len(got))
+	}
+}
+
+// TestOptionalAuthWithASession is the other half of the point: a page that
+// does not require a session still gets the reader's identity when there is
+// one, and gets exactly what RequireAuth would have given it. The
+// comparison against RequireAuth is the assertion that matters — a page
+// that renders for both readers would otherwise be reading whichever set of
+// context values the last change to one of them left in place.
+func TestOptionalAuthWithASession(t *testing.T) {
+	idp := newTestIDP(t)
+	auth := newTestAuthWith(t, idp.provider, newTestAuthKeyring(t))
+
+	token, value := idp.sessionFor(
+		t, auth, "the-reader", time.Now().Add(time.Hour))
+
+	w := httptest.NewRecorder()
+
+	optional, err := auth.OptionalAuth(
+		t.Context(), w, requestWithSession(auth, value))
+	if err != nil {
+		t.Fatalf("optional auth: %v", err)
+	}
+
+	assertSessionContext(t, optional, "the-reader", token.AccessToken)
+
+	// Nothing was refreshed and the value is sealed under the current
+	// key, so resolving the session left the response alone.
+	if got := setCookies(w, auth.cookieName); len(got) != 0 {
+		t.Errorf("the response wrote %d session cookies, want none",
+			len(got))
+	}
+
+	if got := idp.refreshes.Load(); got != 0 {
+		t.Errorf("the token endpoint was called %d times, want none",
+			got)
+	}
+
+	required, err := auth.RequireAuth(t.Context(), httptest.NewRecorder(),
+		requestWithSession(auth, value))
+	if err != nil {
+		t.Fatalf("require auth: %v", err)
+	}
+
+	assertSessionContext(t, required, "the-reader", token.AccessToken)
+}
+
+// TestOptionalAuthRefreshesAnExpiredSession covers the case between the two
+// obvious ones. A session whose access token is inside the refresh margin
+// is a session, so it is refreshed and the cookie rewritten rather than
+// being read as an anonymous visitor — which would log the reader out of a
+// public page for the ten seconds before their next real request.
+func TestOptionalAuthRefreshesAnExpiredSession(t *testing.T) {
+	idp := newTestIDP(t)
+	auth := newTestAuthWith(t, idp.provider, newTestAuthKeyring(t))
+
+	_, value := idp.sessionFor(
+		t, auth, "the-reader", time.Now().Add(-time.Minute))
+
+	w := httptest.NewRecorder()
+
+	ctx, err := auth.OptionalAuth(
+		t.Context(), w, requestWithSession(auth, value))
+	if err != nil {
+		t.Fatalf("optional auth: %v", err)
+	}
+
+	if got := idp.refreshes.Load(); got != 1 {
+		t.Errorf("the token endpoint was called %d times, want exactly 1",
+			got)
+	}
+
+	assertSessionContext(t, ctx,
+		testIDPRefreshedSubject, idp.refreshedAccessToken)
+
+	// The store here is the cookie-backed one, so the refresh moves the
+	// handle and the response carries the new session — once.
+	cookies := setCookies(w, auth.cookieName)
+	if len(cookies) != 1 {
+		t.Fatalf("got %d session cookies, want exactly 1", len(cookies))
+	}
+
+	payload, _ := openTestSession(t, auth, cookies[0].Value)
+
+	if payload.Token.AccessToken != idp.refreshedAccessToken {
+		t.Error("the cookie does not hold the refreshed access token")
+	}
+}
+
+// TestOptionalAuthClearsAnUnusableCookie is the rollout case, from the
+// other side of TestRequireAuthRejectsLegacyPlaintextCookie: a cookie that
+// cannot be opened is cleared here too, so the browser stops sending it,
+// and the reader gets the page anyway.
+func TestOptionalAuthClearsAnUnusableCookie(t *testing.T) {
+	quietLogs(t)
+
+	auth := newTestAuth(t)
+
+	// Exactly what howdah wrote before the cookie was sealed: base64url
+	// of the bare token JSON.
+	data, err := json.Marshal(testToken(time.Now().Add(time.Hour)))
+	if err != nil {
+		t.Fatalf("marshal legacy token: %v", err)
+	}
+
+	legacy := base64.RawURLEncoding.EncodeToString(data)
+
+	w := httptest.NewRecorder()
+
+	ctx, err := auth.OptionalAuth(
+		t.Context(), w, requestWithSession(auth, legacy))
+	if err != nil {
+		t.Fatalf("optional auth: %v", err)
+	}
+
+	assertAnonymous(t, ctx)
+
+	if got := w.Header().Get("Location"); got != "" {
+		t.Errorf("the response redirects to %q, want no redirect", got)
+	}
+
+	cookies := setCookies(w, auth.cookieName)
+	if len(cookies) != 1 {
+		t.Fatalf("got %d session cookies, want 1 clearing it",
+			len(cookies))
+	}
+
+	if cookies[0].Value != "" {
+		t.Errorf("cookie value = %q, want it cleared", cookies[0].Value)
+	}
+}
+
+// TestOptionalAuthWithAnUnverifiableAccessToken is the last row the two
+// methods differ on: a session that resolves out of the store but whose
+// access token this provider's keys do not verify. RequireAuth sends the
+// visitor to log in, because there is nothing it may act on; a public page
+// renders for them anonymously.
+//
+// Neither clears the cookie, and that is deliberate. The failure is not one
+// the visitor caused and says nothing about whether the session is over —
+// the likelier reading is that the provider rotated a signing key or that
+// the token came from somewhere else — so it goes the way of a store that
+// could not answer rather than the way of a cookie that cannot be opened.
+func TestOptionalAuthWithAnUnverifiableAccessToken(t *testing.T) {
+	quietLogs(t)
+
+	idp := newTestIDP(t)
+	auth := newTestAuthWith(t, idp.provider, newTestAuthKeyring(t))
+
+	// Signed by a provider of its own, so the JWT is well formed and the
+	// signature is simply not one the auth's verifier can check.
+	other := newTestIDP(t)
+
+	token := testToken(time.Now().Add(time.Hour))
+	token.AccessToken = other.accessToken(
+		t, "the-reader", time.Now().Add(time.Hour))
+
+	value := sealTestSession(t, auth, token, time.Now().Add(-time.Minute))
+
+	w := httptest.NewRecorder()
+
+	ctx, err := auth.OptionalAuth(
+		t.Context(), w, requestWithSession(auth, value))
+	if err != nil {
+		t.Fatalf("optional auth: %v", err)
+	}
+
+	assertAnonymous(t, ctx)
+
+	if got := w.Header().Get("Location"); got != "" {
+		t.Errorf("the response redirects to %q, want no redirect", got)
+	}
+
+	if got := setCookies(w, auth.cookieName); len(got) != 0 {
+		t.Errorf("the response wrote %d session cookies, want none",
+			len(got))
+	}
+
+	required := httptest.NewRecorder()
+
+	_, err = auth.RequireAuth(
+		t.Context(), required, requestWithSession(auth, value))
+	if !errors.Is(err, ErrSkipRender) {
+		t.Fatalf("require auth error = %v, want %v", err, ErrSkipRender)
+	}
+
+	if got := required.Header().Get("Location"); !strings.Contains(
+		got, "/auth/login") {
+		t.Errorf("require auth redirects to %q, want the login page", got)
+	}
+
+	if got := setCookies(required, auth.cookieName); len(got) != 0 {
+		t.Errorf("require auth wrote %d session cookies, want none",
+			len(got))
+	}
+}
+
+// TestOptionalAuthMiddlewareCarriesTheSession covers the wrapper: what the
+// middleware hands on is the request with OptionalAuth's context, so a
+// handler under it reads the session without asking for it — and a request
+// with no session reaches the same handler unchanged.
+func TestOptionalAuthMiddlewareCarriesTheSession(t *testing.T) {
+	idp := newTestIDP(t)
+	auth := newTestAuthWith(t, idp.provider, newTestAuthKeyring(t))
+
+	token, value := idp.sessionFor(
+		t, auth, "the-reader", time.Now().Add(time.Hour))
+
+	var served atomic.Int64
+
+	handler := auth.OptionalAuthMiddleware(http.HandlerFunc(
+		func(_ http.ResponseWriter, r *http.Request) {
+			served.Add(1)
+
+			if _, ok := Token(r.Context()); ok {
+				assertSessionContext(t, r.Context(),
+					"the-reader", token.AccessToken)
+			}
+		}))
+
+	tests := []struct {
+		name    string
+		request *http.Request
+		session bool
+	}{
+		{
+			name:    "with a session",
+			request: requestWithSession(auth, value),
+			session: true,
+		},
+		{
+			name:    "anonymous",
+			request: httptest.NewRequest("GET", "/things/", nil),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			before := served.Load()
+
+			handler.ServeHTTP(httptest.NewRecorder(), test.request)
+
+			if served.Load() != before+1 {
+				t.Fatal("the middleware did not reach the handler")
+			}
+		})
 	}
 }
