@@ -4,6 +4,41 @@ Everything from v0.1.0 forward is documented here; the releases before it are
 in the git history only. Entries are derived from the release tags, and the
 linked PRs hold the detail.
 
+## [v0.5.0] - Unreleased
+
+**Breaking (the Go floor is 1.27.1):** the `go` directive moves from 1.26.5
+to 1.27.1, so an application on an older toolchain has to move before it can
+build against this version. Dependencies are taken to their current releases
+in the same change: `coreos/go-oidc` to v3.21.0, `golang.org/x/oauth2` to
+v0.36.0, `ttab/newsdoc` to v1.1.0 and, for the Postgres store's tests,
+`ttab/eltest` to v0.4.0.
+
+**New (the session's credential has a context key of howdah's own):** a
+resolved session's bearer token is readable with `howdah.BearerToken(ctx)
+(string, bool)` — the token by itself — and with
+`howdah.AuthorizationHeader(ctx) (string, bool)`, the complete
+`Bearer <token>` header value that an outgoing request and elephantine's
+`AuthInfoParser.AuthInfoFromHeader` both want. `howdah.WithBearerToken(ctx,
+token)` builds such a context, which is what an application's own tests need.
+Until now the credential was reachable only through
+`twirp.HTTPRequestHeaders(ctx)`, so every application that forwards it
+imported `github.com/twitchtv/twirp` for that alone and could not drop the
+dependency however far its own RPC clients had moved to Connect. What a
+consumer has to do: replace the `twirp.HTTPRequestHeaders(ctx)` read and the
+`headers.Get("Authorization")` that follows it with one
+`howdah.AuthorizationHeader(ctx)`, then `go mod tidy`. There is no hurry —
+howdah still writes the Twirp request header as well, so the old read keeps
+working. That write is a shim: it is documented as one, nothing in howdah
+reads it back, and it is removed, together with howdah's own
+`twitchtv/twirp` dependency, when the fleet's last Twirp mount goes.
+
+Changes:
+
+- Documentation: the README gains "Forwarding the session's credential to a
+  backend service", with the before and after of the move off
+  `twirp.HTTPRequestHeaders`, and `docs/architecture.md` says why the shim
+  exists and what ends it.
+
 ## [v0.4.1] - 2026-09-04
 
 **New (reaching `OptionalAuth` through the authenticator):**

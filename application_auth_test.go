@@ -1563,6 +1563,15 @@ func assertAnonymous(t *testing.T, ctx context.Context) {
 			accessToken.Subject)
 	}
 
+	if token, ok := BearerToken(ctx); ok {
+		t.Errorf("the context carries the bearer token %q, want none", token)
+	}
+
+	if header, ok := AuthorizationHeader(ctx); ok {
+		t.Errorf("the context carries the Authorization header %q, want none",
+			header)
+	}
+
 	if headers, ok := twirp.HTTPRequestHeaders(ctx); ok {
 		t.Errorf("the context carries the Twirp header %q, want none",
 			headers.Get("Authorization"))
@@ -1571,9 +1580,10 @@ func assertAnonymous(t *testing.T, ctx context.Context) {
 
 // assertSessionContext checks everything a resolved session puts in the
 // context: the token set for the handler, the verified access token for the
-// claims, and the Authorization header for whatever the handler calls over
-// Twirp. All three, because it is the set of them RequireAuth and
-// OptionalAuth have to agree on.
+// claims, and the bearer token for whatever the handler calls on the
+// session's behalf — under howdah's own key and under the Twirp shim's,
+// which have to agree. All of it, because it is the set of them RequireAuth
+// and OptionalAuth have to agree on.
 func assertSessionContext(
 	t *testing.T, ctx context.Context, subject string, accessToken string,
 ) {
@@ -1599,14 +1609,33 @@ func assertSessionContext(
 			verified.Subject, subject)
 	}
 
+	bearer, ok := BearerToken(ctx)
+	if !ok {
+		t.Fatal("the context carries no bearer token")
+	}
+
+	if bearer != accessToken {
+		t.Errorf("the bearer token is %q, want %q", bearer, accessToken)
+	}
+
+	authHeader, ok := AuthorizationHeader(ctx)
+	if !ok {
+		t.Fatal("the context carries no Authorization header")
+	}
+
+	if want := "Bearer " + accessToken; authHeader != want {
+		t.Errorf("the Authorization header is %q, want %q", authHeader, want)
+	}
+
+	// The Twirp shim, until the fleet's last Twirp mount is retired.
 	headers, ok := twirp.HTTPRequestHeaders(ctx)
 	if !ok {
 		t.Fatal("the context carries no Twirp request headers")
 	}
 
-	if got, want := headers.Get("Authorization"),
-		"Bearer "+accessToken; got != want {
-		t.Errorf("the Authorization header is %q, want %q", got, want)
+	if got := headers.Get("Authorization"); got != authHeader {
+		t.Errorf("the Twirp Authorization header is %q, want %q",
+			got, authHeader)
 	}
 }
 
@@ -1880,5 +1909,40 @@ func TestOptionalAuthMiddlewareCarriesTheSession(t *testing.T) {
 				t.Fatal("the middleware did not reach the handler")
 			}
 		})
+	}
+}
+
+// TestBearerTokenContext covers the accessors on their own, without a
+// session behind them: WithBearerToken is exported so an application can
+// build the context a handler expects in its own tests, and
+// AuthorizationHeader has to agree with it.
+func TestBearerTokenContext(t *testing.T) {
+	ctx := WithBearerToken(t.Context(), "a-token")
+
+	token, ok := BearerToken(ctx)
+	if !ok {
+		t.Fatal("the context carries no bearer token")
+	}
+
+	if token != "a-token" {
+		t.Errorf("the bearer token is %q, want %q", token, "a-token")
+	}
+
+	header, ok := AuthorizationHeader(ctx)
+	if !ok {
+		t.Fatal("the context carries no Authorization header")
+	}
+
+	if header != "Bearer a-token" {
+		t.Errorf("the Authorization header is %q, want %q",
+			header, "Bearer a-token")
+	}
+
+	if _, ok := BearerToken(t.Context()); ok {
+		t.Error("a bare context reports a bearer token")
+	}
+
+	if _, ok := AuthorizationHeader(t.Context()); ok {
+		t.Error("a bare context reports an Authorization header")
 	}
 }

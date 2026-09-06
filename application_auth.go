@@ -337,6 +337,7 @@ func (a *OIDCAuth) MenuHook(hooks *MenuHooks) {
 var (
 	tokenCtxKey       int
 	accessTokenCtxKey int
+	bearerTokenCtxKey int
 )
 
 // AccessToken returns the verified access token from the context. Use the
@@ -358,6 +359,43 @@ func Token(ctx context.Context) (*oauth2.Token, bool) {
 	return token, ok
 }
 
+// WithBearerToken returns a context carrying the access token that calls made
+// on the session's behalf present. RequireAuth and OptionalAuth put the
+// session's own token there; an application calls this directly in tests, or
+// where it acts for a session it resolved some other way.
+func WithBearerToken(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, &bearerTokenCtxKey, token)
+}
+
+// BearerToken returns the access token that calls made on the session's
+// behalf present, without the "Bearer " prefix, and reports whether the
+// context carries a session at all. Use it where the credential has to be
+// assembled into something else — an http.Header for a Connect client's
+// outgoing headers, say. AuthorizationHeader is the ready-made value for the
+// common case.
+//
+// This is the same string as Token's AccessToken field, under a key of its
+// own so that code which only forwards the credential need not be handed the
+// refresh token as well.
+func BearerToken(ctx context.Context) (string, bool) {
+	token, ok := ctx.Value(&bearerTokenCtxKey).(string)
+	return token, ok
+}
+
+// AuthorizationHeader returns the session's credential as a complete
+// Authorization header value, "Bearer <token>", and reports whether the
+// context carries a session at all. It is what a handler forwards to a
+// backend service, and what elephantine's AuthInfoParser.AuthInfoFromHeader
+// expects to be given.
+func AuthorizationHeader(ctx context.Context) (string, bool) {
+	token, ok := BearerToken(ctx)
+	if !ok {
+		return "", false
+	}
+
+	return "Bearer " + token, true
+}
+
 func (a *OIDCAuth) OIDCUserInfo(ctx context.Context) (*oidc.UserInfo, error) {
 	token, ok := ctx.Value(&tokenCtxKey).(*oauth2.Token)
 	if !ok {
@@ -376,12 +414,12 @@ func (a *OIDCAuth) OIDCUserInfo(ctx context.Context) (*oidc.UserInfo, error) {
 // carries it, or sends the visitor to the login page. A page that may be
 // read by somebody who is not logged in calls OptionalAuth instead.
 //
-// On success the returned context carries an Authorization header for
-// anything the handler calls over Twirp, and the token set and verified
-// access token for the handler itself — Token and AccessToken. An access
-// token inside the refresh margin is refreshed on the way, and the session
-// cookie is rewritten when the store's handle moved or the value came in
-// under a retiring key.
+// On success the returned context carries the bearer token for anything the
+// handler calls on the session's behalf — BearerToken and
+// AuthorizationHeader — and the token set and verified access token for the
+// handler itself — Token and AccessToken. An access token inside the refresh
+// margin is refreshed on the way, and the session cookie is rewritten when
+// the store's handle moved or the value came in under a retiring key.
 //
 // A session cookie that cannot be used is cleared and the visitor is sent
 // to log in again. A session that merely could not be *resolved* — a store
@@ -561,9 +599,9 @@ func (a *OIDCAuth) OptionalAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// sessionContext is what an authenticated request carries: the access token
-// in an Authorization header for anything the handler calls over Twirp, and
-// the token set and the verified access token for the handler itself.
+// sessionContext is what an authenticated request carries: the bearer token
+// for anything the handler calls on the session's behalf, and the token set
+// and the verified access token for the handler itself.
 //
 // It is a function of its own so that a session resolved through
 // RequireAuth and one resolved through OptionalAuth carry exactly the same
@@ -572,7 +610,14 @@ func (a *OIDCAuth) OptionalAuthMiddleware(next http.Handler) http.Handler {
 func sessionContext(
 	ctx context.Context, token *oauth2.Token, accessToken *oidc.IDToken,
 ) (context.Context, error) {
-	authCtx, err := twirp.WithHTTPRequestHeaders(ctx, http.Header{
+	authCtx := WithBearerToken(ctx, token.AccessToken)
+
+	// Shim: the same credential under Twirp's request-header key, so that a
+	// consumer still reading it with twirp.HTTPRequestHeaders keeps working
+	// while it moves to BearerToken or AuthorizationHeader. Nothing in
+	// howdah reads it back, and it goes away — with the twitchtv/twirp
+	// dependency — once the fleet's last Twirp mount is retired.
+	authCtx, err := twirp.WithHTTPRequestHeaders(authCtx, http.Header{
 		"Authorization": []string{fmt.Sprintf("Bearer %s", token.AccessToken)},
 	})
 	if err != nil {

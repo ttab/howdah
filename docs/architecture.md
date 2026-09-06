@@ -115,6 +115,17 @@ access token verification, and `sessionContext` — which is a function of its
 own precisely so that a session resolved either way carries the same things.
 Only the failure branches differ, and they differ in one interesting place.
 
+**The session's credential travels under howdah's own context key**, read with
+`BearerToken` or `AuthorizationHeader`. `sessionContext` writes it a second
+time into Twirp's request-header key, which is where it lived alone until
+v0.5.0. That second write is a shim, and it is the only thing keeping
+`github.com/twitchtv/twirp` in howdah's `go.mod`: it is there so that a
+consumer still reading the credential with `twirp.HTTPRequestHeaders` keeps
+working while it moves its read, and it goes with the fleet's last Twirp
+mount. The key is howdah's own because otherwise no application that forwards
+the credential can drop its own Twirp dependency, whatever it does to its own
+RPC clients — the credential, not the RPC stack, was what pinned them.
+
 ```
                        RequireAuth                 OptionalAuth
 no session cookie      302 → login                 anonymous
