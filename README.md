@@ -422,10 +422,62 @@ maximum session age, or holding a refresh token the provider has refused — is
 cleared on the way out, so the browser stops sending it. A session it merely
 could not *resolve* is a different matter: a store that would not answer
 leaves the cookie alone and returns a 503, because the session is very likely
-still there and the cookie may be the only handle to it. On success it adds an
-`Authorization: Bearer` header to the context (for forwarding to backend
-services via Twirp) and stores the verified access token, retrievable with
+still there and the cookie may be the only handle to it. On success it puts
+the session's bearer token on the context, for forwarding to backend services,
+and stores the verified access token, retrievable with
 `howdah.AccessToken(ctx)`.
+
+### Forwarding the session's credential to a backend service
+
+A handler that calls a backend service on the reader's behalf sends the
+session's own access token, so the service authorizes the reader and not the
+application:
+
+```go
+// "Bearer <token>", the whole header value.
+authHeader, ok := howdah.AuthorizationHeader(ctx)
+if !ok {
+    return nil, howdah.HTTPErrorf(http.StatusUnauthorized,
+        howdah.TL("NotLoggedIn", "You have to be logged in"),
+        "the context carries no session")
+}
+
+info, err := authParser.AuthInfoFromHeader(authHeader)
+```
+
+`howdah.BearerToken(ctx)` is the same credential without the `Bearer ` prefix,
+for building it into something else — an `http.Header` for a Connect client's
+outgoing headers, say. Both report `false` for a context with no session, and
+`howdah.WithBearerToken(ctx, token)` builds such a context in an application's
+own tests. The token is `howdah.Token(ctx)`'s `AccessToken` field under a key
+of its own, so code that only forwards the credential is not handed the
+refresh token as well.
+
+**Moving off `twirp.HTTPRequestHeaders`.** Until v0.5.0 the credential was
+reachable only through Twirp's request-header context key, so an application
+read it with `twirp.HTTPRequestHeaders(ctx)` and pulled `github.com/twitchtv/twirp`
+into its own `go.mod` to do it. Replace that read:
+
+```go
+// Before.
+headers, ok := twirp.HTTPRequestHeaders(ctx)
+if !ok {
+    return ctx, nil
+}
+
+authHeader := headers.Get("Authorization")
+
+// After.
+authHeader, ok := howdah.AuthorizationHeader(ctx)
+if !ok {
+    return ctx, nil
+}
+```
+
+howdah still writes the Twirp header as well, so the old read keeps working
+and the two can be changed independently. That write is a shim with an end
+date: it goes when the fleet's last Twirp mount does, and with it howdah's
+`twitchtv/twirp` dependency.
 
 ### Public pages that know who is reading them
 
@@ -452,8 +504,9 @@ func (c *MyComponent) handlePublicPage(
 A request that carries a usable session comes out of it exactly as it would
 out of `RequireAuth` — resolved through the store, refreshed if the access
 token was inside the refresh margin, the session cookie rewritten if the
-handle moved or came in under a retiring key, and `howdah.Token` and
-`howdah.AccessToken` working on the returned context. Everything else returns
+handle moved or came in under a retiring key, and `howdah.Token`,
+`howdah.AccessToken` and `howdah.BearerToken` working on the returned
+context. Everything else returns
 the context unchanged and a nil error: no cookie, a cookie that cannot be used
 (which is cleared, exactly as `RequireAuth` clears it), an access token this
 provider's keys do not verify, or a store that could not answer. That last
