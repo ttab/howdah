@@ -4,7 +4,7 @@ Everything from v0.1.0 forward is documented here; the releases before it are
 in the git history only. Entries are derived from the release tags, and the
 linked PRs hold the detail.
 
-## [v0.5.0] - Unreleased
+## [v0.5.0] - 2026-09-07
 
 **Breaking (the Go floor is 1.27.1):** the `go` directive moves from 1.26.5
 to 1.27.1, so an application on an older toolchain has to move before it can
