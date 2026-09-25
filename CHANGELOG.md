@@ -4,7 +4,7 @@ Everything from v0.1.0 forward is documented here; the releases before it are
 in the git history only. Entries are derived from the release tags, and the
 linked PRs hold the detail.
 
-## [v0.5.1] - Unreleased
+## [v0.5.1] - 2026-09-25
 
 **New (the log out menu item can be turned off):** `WithoutLogoutMenuItem()`
 stops `OIDCAuth` contributing its "Log out" item to the menu, for an
