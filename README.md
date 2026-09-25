@@ -160,6 +160,10 @@ hooks support two phases:
 The active menu item is determined automatically by matching the current
 request path against each item's `HREF`.
 
+`OIDCAuth` contributes a "Log out" item of its own. Pass
+`howdah.WithoutLogoutMenuItem()` to drop it in an application that draws its
+own log out control; the `/auth/logout` route is registered either way.
+
 ```go
 func (c *MyComponent) MenuHook(hooks *howdah.MenuHooks) {
     hooks.RegisterHook(func() []howdah.MenuItem {

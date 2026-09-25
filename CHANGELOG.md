@@ -4,6 +4,15 @@ Everything from v0.1.0 forward is documented here; the releases before it are
 in the git history only. Entries are derived from the release tags, and the
 linked PRs hold the detail.
 
+## [v0.5.1] - Unreleased
+
+**New (the log out menu item can be turned off):** `WithoutLogoutMenuItem()`
+stops `OIDCAuth` contributing its "Log out" item to the menu, for an
+application that draws a log out control of its own — a button in the header,
+an entry in a user menu — where howdah's item is a second copy of the same
+link. `GET /auth/logout` is registered either way, so the application's own
+control still has somewhere to point.
+
 ## [v0.5.0] - 2026-09-07
 
 **Breaking (the Go floor is 1.27.1):** the `go` directive moves from 1.26.5

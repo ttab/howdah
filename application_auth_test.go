@@ -1946,3 +1946,46 @@ func TestBearerTokenContext(t *testing.T) {
 		t.Error("a bare context reports an Authorization header")
 	}
 }
+
+// TestLogoutMenuItem covers both halves of WithoutLogoutMenuItem: the item
+// is contributed by default, and suppressing it leaves the logout route
+// alone — an application that draws its own control still needs somewhere
+// for it to point.
+func TestLogoutMenuItem(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		opts  []OIDCAuthOption
+		items int
+	}{
+		{name: "default", items: 1},
+		{
+			name:  "suppressed",
+			opts:  []OIDCAuthOption{WithoutLogoutMenuItem()},
+			items: 0,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			auth := newTestAuth(t, c.opts...)
+
+			var hooks MenuHooks
+
+			auth.MenuHook(&hooks)
+
+			menu := hooks.Collect()
+			if len(menu) != c.items {
+				t.Fatalf("got %d menu items, want %d: %v",
+					len(menu), c.items, menu)
+			}
+
+			httpMux := http.NewServeMux()
+
+			auth.RegisterRoutes(NewPageMux(nil, httpMux))
+
+			r := httptest.NewRequest("GET", "/auth/logout", nil)
+
+			if _, pattern := httpMux.Handler(r); pattern == "" {
+				t.Error("the logout route is not registered")
+			}
+		})
+	}
+}

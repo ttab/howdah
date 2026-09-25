@@ -145,6 +145,19 @@ func WithTokenStore(store TokenStore) OIDCAuthOption {
 	}
 }
 
+// WithoutLogoutMenuItem stops the auth component from contributing its
+// "Log out" menu item. It is for an application that draws a log-out
+// control of its own — a button in the header, an entry in a user menu —
+// where howdah's item would be a second copy of the same link.
+//
+// Nothing else about logging out changes: GET /auth/logout is registered
+// either way, so the application's own control has somewhere to point.
+func WithoutLogoutMenuItem() OIDCAuthOption {
+	return func(a *OIDCAuth) {
+		a.noLogoutMenuItem = true
+	}
+}
+
 // WithInsecureCookies drops the Secure attribute from the cookies the
 // application sets. It is there for plain-http local development, where a
 // Secure cookie is one the browser accepts and then never sends back, and
@@ -171,6 +184,10 @@ type OIDCAuth struct {
 	basePath       BasePath
 	cookieName     string
 	insecure       bool
+
+	// noLogoutMenuItem drops the log out menu item, for an application
+	// that draws its own log out control. See WithoutLogoutMenuItem.
+	noLogoutMenuItem bool
 
 	// store holds the sessions. It is a CookieTokenStore unless the
 	// application passed WithTokenStore, and OIDCAuth cannot tell the
@@ -323,6 +340,10 @@ func (a *OIDCAuth) Keepalive(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *OIDCAuth) MenuHook(hooks *MenuHooks) {
+	if a.noLogoutMenuItem {
+		return
+	}
+
 	hooks.RegisterHook(func() []MenuItem {
 		return []MenuItem{
 			{
